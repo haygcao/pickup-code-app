@@ -6,8 +6,10 @@ import android.content.Intent
 import android.telephony.SmsMessage
 import android.util.Log
 import com.pickupcode.app.App
+import com.pickupcode.app.BuildConfig
 import com.pickupcode.app.data.AppDatabase
 import com.pickupcode.app.extractor.AddressExtractor
+import com.pickupcode.app.extractor.AIExtractor
 import com.pickupcode.app.extractor.CodeExtractor
 import com.pickupcode.app.ocr.OCREngine
 import com.pickupcode.app.preferences.AppPreferences
@@ -83,12 +85,41 @@ class SmsReceiver : BroadcastReceiver() {
                     if (lines.isEmpty()) return@withTimeoutOrNull
 
                     val allText = lines.joinToString(" ") { it.text }
+                    val startMs = System.currentTimeMillis()
                     val results = CodeExtractor.extract(lines, context = context, source = "sms")
                     // 逐类型过滤：用户单独关闭「取餐码」/「取件码」时，该类型短信不得入库+通知
                     // （与无障碍路径 isTypeEnabled、分享路径 isTypeDisabled 行为对齐）
-                    val allResults = results.filter {
-                        it.confidence >= settings.confidenceThreshold && isTypeEnabled(it.type, settings)
+                    val allResults = results
+                        .filter { it.confidence >= settings.confidenceThreshold && isTypeEnabled(it.type, settings) }
+                        .toMutableList()
+
+                    // AI 补识别（与无障碍/分享路径对齐）：正则漏掉的码（如兔喜 5-3858）由 AI 补上。
+                    // 广播限时 8s——AI 只等「剩余预算」：正则没结果时多等一会（AI 是唯一希望），
+                    // 有结果时少等；超时/失败直接用正则结果，绝不拖死短信识别。
+                    if (settings.enableAI && settings.apiKey.isNotBlank()) {
+                        val elapsed = System.currentTimeMillis() - startMs
+                        val budget = (8000L - elapsed - 1500L).coerceIn(1500L, 6000L)
+                        val aiRes = withTimeoutOrNull(budget) {
+                            AIExtractor.extract(allText, settings.apiKey, settings.apiBaseUrl, settings.apiModel)
+                        }
+                        if (aiRes != null) {
+                            if (aiRes.error != null) Log.w(TAG, "AI 识别失败: ${aiRes.error}")
+                            if (BuildConfig.DEBUG) {
+                                Log.d(TAG, "AI 识别返回 ${aiRes.results.size} 条: " +
+                                    aiRes.results.joinToString { "${it.code}(${it.type})" })
+                            }
+                            for (ai in aiRes.results) {
+                                if (!isTypeEnabled(ai.type, settings)) continue
+                                if (allResults.any { it.code == ai.code && it.type == ai.type }) continue
+                                allResults.add(CodeExtractor.ExtractedCode(ai.code, ai.type, ai.source, 1.0f))
+                            }
+                        } else {
+                            Log.d(TAG, "AI 超时未返回（预算 ${budget}ms），仅用正则结果")
+                        }
+                    } else if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "AI 识别未启用（enableAI=${settings.enableAI}, apiKey非空=${settings.apiKey.isNotBlank()}），跳过")
                     }
+
                     if (allResults.isEmpty()) {
                         Log.d(TAG, "短信无取件码，跳过")
                         return@withTimeoutOrNull
