@@ -116,10 +116,16 @@ object AIExtractor {
                 val r = arr.getJSONObject(i)
                 val code = r.optString("code", "").trim()
                 if (code.isBlank()) continue
-                // 格式白名单 + 排除链校验：AI 结果不比正则可靠，只接受合法取餐/取件码格式（复用 CodeExtractor 规则）
-                // isExcluded 为 internal，同包可直接调；补充 isValidPickupCode 之外的内容排除（手机号/金额/运单号等）
-                if (!CodeValidator.isValidPickupCode(code) || CodeValidator.isExcluded(code)) continue
                 val typeStr = r.optString("type", "pickup_parcel")
+                // 与正则"强前缀"路径对齐：AI 有完整上下文（模型看到"取餐码123"），
+                // 放行 2-3 位纯数字取餐码（蜜雪/瑞幸常见）；取件码短码与裸数字噪声仍拒绝。
+                val shortFood = typeStr == "pickup_food" && code.all { it.isDigit() } && code.length in 2..3
+                // 内容噪声（全0全1/递增/连号/手机号子串等）一律拦截
+                if (CodeValidator.isContentNoise(code)) continue
+                // 格式白名单（复用 CodeExtractor 规则单一来源）；短取餐码跳过格式白名单但已过内容检查
+                if (!shortFood && !CodeValidator.isValidPickupCode(code)) continue
+                // isExcluded：排除模式（手机号/金额/运单号等）+ 自学习排除词
+                if (CodeValidator.isExcluded(code)) continue
                 results.add(AIResult(
                     code = code,
                     type = if (typeStr == "pickup_food") CodeExtractor.CodeType.pickup_food
