@@ -114,6 +114,12 @@ object CodeNotificationManager {
 
         val nid = nextNotifyId(context)
         trackNotifyId(type, code, nid)
+        // X/滑动删除走 DeleteIntent → NotificationDismissReceiver（与「忽略」按钮一致：仅收起通知，DB 记录保留）
+        val deleteIntent = PendingIntent.getBroadcast(context, nid,
+            Intent(context, NotificationDismissReceiver::class.java).apply {
+                putExtra("notification_id", nid)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("$iconLabel $title")
@@ -121,7 +127,9 @@ object CodeNotificationManager {
             .setStyle(NotificationCompat.BigTextStyle()
                 .bigText("$iconLabel $source\n$title: $code"))
             .setContentIntent(pendingIntent)
-            .setOngoing(true)
+            // 用户反馈：常驻(ongoing)通知按 X/滑动删不掉。改为可删除——
+            // 码已入库，App 首页随时可查，「已取」按钮负责归档，误删不影响数据。
+            .setDeleteIntent(deleteIntent)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
