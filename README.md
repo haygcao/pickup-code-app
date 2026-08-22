@@ -8,7 +8,7 @@
   <img src="screenshots/Screenshot_20260813_164743.jpg" width="30%" alt="截图 3" />
   <img src="screenshots/Screenshot_20260813_165152.jpg" width="30%" alt="截图 4" />
   <img src="screenshots/Screenshot_20260813_163603.jpg" width="30%" alt="截图 1" />
-  <img src="screenshots/Screenshot_20260813_163606.jpg" width="30%" alt="截图 2" />
+  <img src="screenshots/Screenshot_20260813_163606.jpg" width="30%" alt="截图 2" />?
   <img src="screenshots/Screenshot_20260813_165244.jpg" width="30%" alt="截图 5" />
   <img src="screenshots/Screenshot_20260813_165248.jpg" width="30%" alt="截图 6" />
   <img src="screenshots/Screenshot_20260813_165252.jpg" width="30%" alt="截图 7" />
@@ -105,6 +105,7 @@ app/src/main/java/com/pickupcode/app/
 
 | 格式 | 示例 |
 |------|------|
+|二段式|`1-2345`|
 | 三段式 | `1-2-3456`|
 | 四段式 | `A1-2-3-45`|
 | 字母前缀三段式 | `A1-2-3456`|
