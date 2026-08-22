@@ -37,20 +37,42 @@ class PickupCodeTileService : TileService() {
     override fun onClick() {
         super.onClick()
         val enabledInSettings = isEnabledInSettings()
-        val reallyConnected = PickupCodeAccessibilityService.isReallyConnected(this)
+        // 用同进程的 connected 标志判断真实连接（vivo 等 ROM 上
+        // AccessibilityManager.getEnabledAccessibilityServiceList 对已绑定服务会假阴性，误判"未开启"）
+        val reallyConnected = PickupCodeAccessibilityService.connected
         when {
-            // ① 服务真实连接：置触发标记，由常驻服务消费后截图识别；Toast 即时确认，避免"点了没反应"
+            // ① 服务真实连接：武装触发标记，由常驻服务在「控制面板收起后」自动截图识别；
+            //    Toast 即时指引，避免"点了没反应"和"截到控制面板"两类困惑
             enabledInSettings && reallyConnected -> {
-                PickupCodeAccessibilityService.triggerRequested.set(true)
-                Log.d(TAG_TILE, "触发标记已设置（服务已连接）")
-                toast("已触发识别，结果稍后以通知提示")
+                PickupCodeAccessibilityService.armManual(fromPanel = true)
+                Log.d(TAG_TILE, "触发标记已设置（服务已连接，等待面板收起扫描）")
+                toast("已就绪：滑出控制面板，停留在取件码界面后自动识别", long = true)
             }
-            // ② 设置里开着但服务实际没连上（Xiaomi/HyperOS 杀进程后常见）：
-            //    标记会无人消费而静默失效——必须明示并引导重开，而不是假装触发
+            // ② 设置里开着但服务实际没连上（国内 ROM 杀进程后常见，或冷启动 binding 尚未建立）：
+            //    延迟复查 1.5s——binding 建立好了就直接触发；仍没连上才明示并引导重开
             enabledInSettings && !reallyConnected -> {
-                Log.w(TAG_TILE, "无障碍服务设置开启但实际未连接，跳转设置引导重开")
-                toast("无障碍服务未在运行，请重新开启")
-                startAccessibilitySettings()
+                Log.w(TAG_TILE, "无障碍服务设置开启但未连接，延迟复查 1.5s")
+                stateExecutor.execute {
+                    var reconnected = false
+                    for (i in 0 until 3) {
+                        try { Thread.sleep(500) } catch (_: InterruptedException) { break }
+                        if (PickupCodeAccessibilityService.connected) {
+                            reconnected = true
+                            break
+                        }
+                    }
+                    mainHandler.post {
+                        if (reconnected) {
+                            PickupCodeAccessibilityService.armManual(fromPanel = true)
+                            Log.d(TAG_TILE, "延迟复查后服务已连接，触发标记已设置")
+                            toast("已就绪：滑出控制面板，停留在取件码界面后自动识别", long = true)
+                        } else {
+                            Log.w(TAG_TILE, "服务仍未连接，跳转设置引导重开")
+                            toast("无障碍服务未在运行，请重新开启", long = true)
+                            startAccessibilitySettings()
+                        }
+                    }
+                }
             }
             // ③ 未开启：引导设置（M4）
             else -> {
@@ -78,26 +100,39 @@ class PickupCodeTileService : TileService() {
         return enabledServices.split(':').any { it.trim() == target }
     }
 
+    private var listenGeneration = 0
+
     override fun onStartListening() {
         super.onStartListening()
         // 磁贴可用态以「服务真实连接」为准（Low-2 基础上再收紧一层）：
         // 避免设置字符串显示开启但服务实际被杀时磁贴仍亮着 → 点击静默无反应。
-        // Settings.Secure / AccessibilityManager 涉及 Binder/IO，放子线程；磁贴更新回主线程
-        stateExecutor.execute {
-            val ok = isEnabledInSettings() &&
-                PickupCodeAccessibilityService.isReallyConnected(this@PickupCodeTileService)
-            mainHandler.post {
-                qsTile?.apply {
-                    state = if (ok) Tile.STATE_ACTIVE else Tile.STATE_UNAVAILABLE
-                    updateTile()
-                }
+        // 冷启动竞态修复：进程被杀后拉开面板，无障碍服务 binding 可能尚未建立（系统异步重连），
+        // 立刻查会误判"未连接"→磁贴灰一整天（只在下次开面板才刷新）。因此分 0s/1.5s/3s 三拍复查。
+        // 注意：灰态用 STATE_INACTIVE 而非 UNAVAILABLE——vivo 等 ROM 上 UNAVAILABLE 磁贴点击不回调 onClick，
+        // 用户会"点了没有任何反应"；INACTIVE 保持可点，onClick 三分支负责引导。
+        val gen = ++listenGeneration
+        for (delayMs in longArrayOf(0L, 1500L, 3000L)) {
+            stateExecutor.execute {
+                val ok = isEnabledInSettings() &&
+                    PickupCodeAccessibilityService.connected
+                mainHandler.postDelayed({
+                    if (gen != listenGeneration) return@postDelayed // 新一次 onStartListening 已接管，丢弃旧结果
+                    qsTile?.apply {
+                        val target = if (ok) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+                        if (state != target) {
+                            state = target
+                            updateTile()
+                        }
+                    }
+                }, delayMs)
             }
         }
     }
 
-    private fun toast(msg: String) {
+    private fun toast(msg: String, long: Boolean = false) {
         try {
-            Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
+            val duration = if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
+            Toast.makeText(applicationContext, msg, duration).show()
         } catch (e: Exception) {
             Log.w(TAG_TILE, "Toast 失败: ${e.message}")
         }

@@ -4,6 +4,8 @@ import android.os.Build
 import android.content.Intent
 import android.util.Log
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -41,6 +43,7 @@ class MainActivity : ComponentActivity() {
 
     private var hasNotificationPermission by mutableStateOf(false)
     private var isAccessibilityEnabled by mutableStateOf(false)
+    private var isAccessibilityConnected by mutableStateOf(false)
     // Medium-1: currentScreen/selectedCodeId/showManualDialog 已移至 setContent 内用 rememberSaveable 管理（旋转不丢状态）
     // B3: showDuplicate 通知点击后待处理的去重入口跳转（onCreate/onNewIntent 置位，组合期消费）
     private var pendingDedup by mutableStateOf(false)
@@ -66,7 +69,9 @@ class MainActivity : ComponentActivity() {
         } else true
 
         // Medium-2: 组合期不再同步读无障碍状态（每次重组重复 binder 调用）；onCreate 先赋值一次，onResume 持续刷新
-        isAccessibilityEnabled = isAccessibilityServiceEnabled()
+        refreshAccessibilityStates()
+        // 冷启动竞态：无障碍服务绑定可能晚于 Activity 创建（几百 ms~秒级），1.5s 后补刷一次
+        Handler(Looper.getMainLooper()).postDelayed({ refreshAccessibilityStates() }, 1500)
 
         setContent {
             // Medium-1: 导航状态用 rememberSaveable 管理，旋转屏幕不丢失
@@ -94,7 +99,8 @@ class MainActivity : ComponentActivity() {
                 when (screen) {
                     Screen.Home -> HomeScreen(
                         hasNotificationPermission = hasNotificationPermission,
-                        isAccessibilityEnabled = isAccessibilityEnabled,
+                        isAccessibilityEnabled = isAccessibilityConnected,
+                        accessibilityEnabledInSettings = isAccessibilityEnabled,
                         hideAccessibilityCard = settings.hideAccessibilityCard,
                         hideGuideCard = settings.hideGuideCard,
                         onRequestNotificationPermission = {
@@ -175,7 +181,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        refreshAccessibilityStates()
+    }
+
+    /** 刷新无障碍两种状态：设置里是否开启（字符串）+ 本进程服务是否真实连接（connected 标志）。 */
+    private fun refreshAccessibilityStates() {
         isAccessibilityEnabled = isAccessibilityServiceEnabled()
+        isAccessibilityConnected = isAccessibilityEnabled && PickupCodeAccessibilityService.connected
     }
 
     @Composable
@@ -248,7 +260,9 @@ class MainActivity : ComponentActivity() {
     private fun openAccessibilitySettings() {
         try {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            Toast.makeText(this, "在列表中找到「码上闪记」并开启", Toast.LENGTH_LONG).show()
+            // 无障碍列表里有两条：主服务「码上闪记」和「码上闪记（音量键快捷识别）」——
+            // 必须开启不带括号的主服务，括号那条只是音量键快捷方式的触发通道
+            Toast.makeText(this, "开启列表里不带括号的「码上闪记」；（音量键快捷方式）那条不是主功能", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             Toast.makeText(this, "无法打开无障碍设置", Toast.LENGTH_SHORT).show()
         }

@@ -2,11 +2,13 @@ package com.pickupcode.app.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ComponentName
 import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.service.quicksettings.TileService
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
@@ -47,6 +49,35 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         @JvmField
         val triggerRequested = AtomicBoolean(false)
 
+        /** 触发来源：true=磁贴（需等控制面板收起再扫），false=音量键（目标界面已在当前屏幕，立即扫）。 */
+        @Volatile
+        var triggerViaPanel = false
+            private set
+        /** 触发（武装）时刻。 */
+        @Volatile
+        private var armedAtMs = 0L
+        /** 武装后最后一次收到控制面板（systemui）窗口事件的时刻；0=武装后未见过面板事件。 */
+        @Volatile
+        private var lastSystemUiEventAtMs = 0L
+
+        private const val SYSTEMUI_PKG = "com.android.systemui"
+        /** 磁贴触发后，面板静默多久开始兜底扫描（用户有充分时间滑出面板并停在目标界面）。 */
+        private const val PANEL_SILENCE_MS = 2000L
+        /** 完全没收到面板事件（个别 ROM 不派发）时，武装多久后兜底扫描。 */
+        private const val PANEL_FALLBACK_MS = 2000L
+
+        /**
+         * 手动触发（磁贴/音量键）统一入口：置标记 + 记录来源与时刻。
+         * @param fromPanel true=快捷设置磁贴触发——消费策略会等控制面板收起；
+         *                  false=音量键/无障碍快捷方式触发——立即消费。
+         */
+        fun armManual(fromPanel: Boolean) {
+            triggerRequested.set(true)
+            triggerViaPanel = fromPanel
+            armedAtMs = System.currentTimeMillis()
+            lastSystemUiEventAtMs = 0
+        }
+
         /** 服务实例当前是否已被系统真实绑定（区别于 Settings.Secure 里的开关字符串）。
          *  onServiceConnected=true / onUnbind、onDestroy=false。 */
         @Volatile
@@ -65,7 +96,19 @@ class PickupCodeAccessibilityService : AccessibilityService() {
                     ?: return false
                 val target = "${context.packageName}/${PickupCodeAccessibilityService::class.java.name}"
                 am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-                    .any { it.id == target }
+                    .any { info ->
+                        // 标准路径：id = "包名/类名"
+                        val id = try { info.id } catch (_: Exception) { null }
+                        if (id != null) {
+                            id == target
+                        } else {
+                            // 个别 ROM 返回的 info 无 id：退到 resolveInfo 比对包名+类名
+                            info.resolveInfo?.serviceInfo?.let { si ->
+                                si.packageName == context.packageName &&
+                                    si.name == PickupCodeAccessibilityService::class.java.name
+                            } == true
+                        }
+                    }
             } catch (e: Exception) {
                 Log.w(TAG, "查询无障碍真实连接状态失败", e)
                 false
@@ -106,6 +149,15 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** 让系统重新回调磁贴的 onStartListening，磁贴按本进程 connected 标志刷新亮/暗。 */
+    private fun notifyTileRefresh() {
+        try {
+            TileService.requestListeningState(this, ComponentName(this, PickupCodeTileService::class.java))
+        } catch (e: Exception) {
+            Log.w(TAG, "通知磁贴刷新失败: ${e.message}")
+        }
+    }
+
     private var lastAutoScanPkg: String? = null
     private var lastAutoScanTime = 0L
 
@@ -113,6 +165,9 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         connected = true
         Log.d(TAG, "无障碍服务已连接")
+        // 通知磁贴刷新状态：vivo 等 ROM 上 AccessibilityManager.getEnabledAccessibilityServiceList
+        // 对已绑定服务会假阴性，磁贴以本进程 connected 标志为准（同进程内无 binder 歧义）
+        notifyTileRefresh()
 
         // Top1: 服务实例可能在 onUnbind 后复用（用户关→开无障碍、系统临时解绑均会再次走到这里）。
         // 上一轮 onUnbind 已 cancel scope / shutdown executor，必须重建，否则识别功能静默全废。
@@ -134,28 +189,70 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         mainHandler.removeCallbacks(heartbeat)
         mainHandler.postDelayed(heartbeat, 3000)
 
-        // 冷启动竞态修复：磁贴可能在服务连接完成前就已置好触发标记
-        // （进程刚被磁贴点击拉起时两个 binding 并行），连接后立即消费，不干等 3 秒心跳。
-        // 否则在旧版上会误以为"点了没反应"——实际只是等心跳。
-        if (triggerRequested.getAndSet(false)) {
-            Log.d(TAG, "连接后立即消费触发标记")
-            mainHandler.post { performScan("手动触发") }
+        // 冷启动竞态：磁贴可能在服务连接前已置标记。但**不在此立即扫描**——
+        // 此刻用户多半还站在控制面板里，立即截图会截到面板（小红书用户反馈"还在面板里就开始记录了"）。
+        // 交给心跳（按 triggerViaPanel 策略等面板收起）或窗口事件消费。
+        if (triggerRequested.get()) {
+            Log.d(TAG, "连接时触发标记待消费（按策略等待面板收起后自动扫描）")
         }
     }
 
     private val heartbeat = object : Runnable {
         override fun run() {
-            if (triggerRequested.getAndSet(false)) {
-                Log.d(TAG, "心跳兜底扫描")
-                performScan("手动触发")
+            if (triggerRequested.get() && manualTriggerDue()) {
+                consumeManualTrigger("心跳兜底")
             }
             mainHandler.postDelayed(this, 3000)
         }
     }
 
+    /** 手动触发是否到了可扫描时刻：磁贴触发必须等控制面板收起（防截到面板），音量键立即。 */
+    private fun manualTriggerDue(): Boolean {
+        if (!triggerViaPanel) return true // 音量键：目标界面已在当前屏幕
+        val now = System.currentTimeMillis()
+        return if (lastSystemUiEventAtMs >= armedAtMs) {
+            // 武装后见过面板事件：面板已操作过，静默 PANEL_SILENCE_MS 后即可扫
+            now - lastSystemUiEventAtMs >= PANEL_SILENCE_MS
+        } else {
+            // 武装后未收到任何面板事件（个别 ROM 不派发 systemui 事件）：宽限 PANEL_FALLBACK_MS 后兜底扫
+            now - armedAtMs >= PANEL_FALLBACK_MS
+        }
+    }
+
+    /** 消费手动触发标记并调度扫描（延迟 1.2s 让控制面板收起动画完成，扫描前还会再校验活动窗口）。 */
+    private fun consumeManualTrigger(reason: String) {
+        if (triggerRequested.getAndSet(false)) {
+            triggerViaPanel = false
+            armedAtMs = 0
+            lastSystemUiEventAtMs = 0
+            Log.d(TAG, "磁贴触发消费（$reason），延迟扫描")
+            mainHandler.postDelayed({ performScanAfterPanelClose(0) }, 1200)
+        }
+    }
+
+    /**
+     * 扫描前再等一等：若当前活动窗口仍是系统控制面板/通知栏（个别 ROM 事件时序靠前），
+     * 每秒复查一次，最多推迟 6 秒，避免截图截到面板"显示没有码"。
+     */
+    private fun performScanAfterPanelClose(tries: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && tries < 6) {
+            val activePkg = try {
+                rootInActiveWindow?.packageName?.toString()
+            } catch (_: Exception) { null }
+            if (activePkg == SYSTEMUI_PKG) {
+                Log.d(TAG, "活动窗口仍是控制面板，推迟扫描(第${tries + 1}次)")
+                mainHandler.postDelayed({ performScanAfterPanelClose(tries + 1) }, 1000)
+                return
+            }
+        }
+        performScan("手动触发")
+    }
+
     override fun onUnbind(intent: android.content.Intent?): Boolean {
         // 收敛协程与 Handler，避免服务卸载后空转/泄漏（H2/H3）
         connected = false
+        Log.d(TAG, "无障碍服务已解绑")
+        notifyTileRefresh()
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         screenshotExecutor.shutdownNow()
@@ -166,6 +263,7 @@ class PickupCodeAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         connected = false
+        notifyTileRefresh()
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         screenshotExecutor.shutdownNow()
@@ -175,11 +273,16 @@ class PickupCodeAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (triggerRequested.getAndSet(false)) {
-            Log.d(TAG, "磁贴触发，延迟扫描")
-            mainHandler.postDelayed({
-                performScan("手动触发")
-            }, 1200)
+        // 手动触发（磁贴/音量键）：
+        //  - 控制面板（systemui）窗口事件只记录时刻、不消费标记——面板还开着，截了也是面板；
+        //  - 非面板窗口事件 = 面板已收起、目标应用窗口回到前台 → 消费并延迟扫描。
+        if (triggerRequested.get()) {
+            val pkg = event?.packageName?.toString()
+            if (pkg == SYSTEMUI_PKG) {
+                lastSystemUiEventAtMs = System.currentTimeMillis()
+                return
+            }
+            consumeManualTrigger("窗口=${pkg ?: "?"}")
             return
         }
 
