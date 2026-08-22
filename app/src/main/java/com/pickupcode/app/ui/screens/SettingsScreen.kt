@@ -1,8 +1,13 @@
 package com.pickupcode.app.ui.screens
 
 import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
@@ -26,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -33,6 +39,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.pickupcode.app.BuildConfig
 import com.pickupcode.app.learner.PatternLearner
 import com.pickupcode.app.preferences.AppPreferences
@@ -175,6 +183,7 @@ fun SettingsScreen(onBack: () -> Unit, onStatsClick: () -> Unit = {}) {
         ) {
             RecognitionSettingsSection(sc)
             InputMethodsSection(sc)
+            NotificationStatusCard(sc)
             VerifyServicesSection(sc)
             LearningStatsSection(sc, onStatsClick)
             AppearanceSection(sc)
@@ -352,6 +361,98 @@ private fun InputMethodsSection(sc: SettingsCtx) {
             checked = sc.s.enableExpiryRemind,
             onChange = { v -> sc.save { AppPreferences.setEnableExpiryRemind(sc.ctx, v) } }
         )
+    }
+}
+
+/* ═══════════════════ 通知状态（各 ROM 通知管理适配） ═══════════════════ */
+
+private enum class NotifStatus { OK, NEED_PERMISSION, DISABLED, CHANNEL_SILENT }
+
+/**
+ * 三态检测：① Android 13+ 通知权限 ② 系统「通知管理」总开关（vivo/小米等 ROM 独立于 13 权限）
+ * ③ 各渠道是否被单独静默（importance == NONE）。
+ * 返回 (状态, 说明文案)。正常时返回 OK。
+ */
+private fun computeNotificationStatus(ctx: Context): Pair<NotifStatus, String> {
+    val nm = ctx.getSystemService(NotificationManager::class.java)
+        ?: return NotifStatus.OK to ""
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) !=
+        PackageManager.PERMISSION_GRANTED
+    ) {
+        return NotifStatus.NEED_PERMISSION to "Android 13+ 需要「通知」权限，未授权时所有通知都不会显示"
+    }
+    // areNotificationsEnabled() 反映系统通知管理总开关（含 ROM 层），不只 Android 13 权限
+    if (!nm.areNotificationsEnabled()) {
+        return NotifStatus.DISABLED to "系统「通知管理」里本 App 的通知被整体关闭，识别结果不会提醒"
+    }
+    val silentChannels = listOf("pickup_food", "pickup_parcel", "pickup_coupon")
+        .mapNotNull { nm.getNotificationChannel(it) }
+        .filter { it.importance == NotificationManager.IMPORTANCE_NONE }
+    if (silentChannels.isNotEmpty()) {
+        return NotifStatus.CHANNEL_SILENT to
+            "以下渠道被设为静默，通知可能不显示：${silentChannels.joinToString("、") { it.name }}"
+    }
+    return NotifStatus.OK to ""
+}
+
+private fun openNotificationSettings(ctx: Context) {
+    try {
+        ctx.startActivity(
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+        )
+    } catch (_: Exception) {
+        try {
+            ctx.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+            )
+        } catch (_: Exception) {
+            Toast.makeText(ctx, "无法打开通知设置", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+/** 通知状态卡片：有问题才显示（正常时不占版面）；从系统设置返回时自动刷新。 */
+@Composable
+private fun NotificationStatusCard(sc: SettingsCtx) {
+    val ctx = sc.ctx
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var refreshTick by remember { mutableIntStateOf(0) }
+    // 从系统「通知设置」页返回后重算（用户可能刚去开了开关）
+    DisposableEffect(lifecycleOwner) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) refreshTick++
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+    val (status, desc) = remember(refreshTick) { computeNotificationStatus(ctx) }
+    if (status == NotifStatus.OK) return
+
+    val isError = status == NotifStatus.DISABLED
+    val container = if (isError) MaterialTheme.colorScheme.errorContainer
+    else MaterialTheme.colorScheme.tertiaryContainer
+    val onContainer = if (isError) MaterialTheme.colorScheme.onErrorContainer
+    else MaterialTheme.colorScheme.onTertiaryContainer
+    val title = when (status) {
+        NotifStatus.NEED_PERMISSION -> "🔧 需要通知权限"
+        NotifStatus.DISABLED -> "⚠️ 系统通知被关闭"
+        else -> "⚠️ 部分通知渠道被静默"
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = container),
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(4.dp))
+            Text(desc, style = MaterialTheme.typography.bodySmall, color = onContainer)
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = { openNotificationSettings(ctx) }) { Text("去开启") }
+        }
     }
 }
 
