@@ -76,6 +76,7 @@ import java.time.ZoneId
 fun HomeScreen(
     hasNotificationPermission: Boolean,
     isAccessibilityEnabled: Boolean,
+    accessibilityEnabledInSettings: Boolean,
     hideAccessibilityCard: Boolean,
     hideGuideCard: Boolean,
     onRequestNotificationPermission: () -> Unit,
@@ -161,7 +162,6 @@ fun HomeScreen(
     LaunchedEffect(activeHistory) { vm.refreshDedupCount() }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -194,13 +194,19 @@ fun HomeScreen(
             }
         }
     ) { padding ->
-        LazyColumn(
+        // 顶部提示层：snackbar（"已移至回收站"/错误提示）固定显示在界面上方（顶部栏之下），
+        // 不再默认贴屏幕底部（用户要求：弹窗放到界面上方）
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .background(MaterialTheme.colorScheme.background),
-            contentPadding = PaddingValues(bottom = 80.dp)
         ) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background),
+                contentPadding = PaddingValues(bottom = 80.dp)
+            ) {
             // FilterChips
             item {
                 FilterChipRow(currentFilter = typeFilter, onFilterChange = { typeFilter = it })
@@ -239,10 +245,17 @@ fun HomeScreen(
             // 无障碍服务卡片
             if (!hideAccessibilityCard) {
                 item {
-                    val containerColor = if (isAccessibilityEnabled)
-                        MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.tertiaryContainer
-                    val title = if (isAccessibilityEnabled) "✅ 无障碍服务已开启" else "🔧 需要开启无障碍服务"
+                    // 三态：开启且运行 / 设置里开了但服务未运行（被系统杀，vivo 常见）/ 未开启
+                    val containerColor = when {
+                        isAccessibilityEnabled -> MaterialTheme.colorScheme.primaryContainer
+                        accessibilityEnabledInSettings -> MaterialTheme.colorScheme.errorContainer
+                        else -> MaterialTheme.colorScheme.tertiaryContainer
+                    }
+                    val title = when {
+                        isAccessibilityEnabled -> "✅ 无障碍服务已开启"
+                        accessibilityEnabledInSettings -> "⚠️ 无障碍服务未在运行"
+                        else -> "🔧 需要开启无障碍服务"
+                    }
 
                     Card(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
@@ -263,16 +276,20 @@ fun HomeScreen(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Spacer(Modifier.height(4.dp))
-                                Text("固定后停留在要识别的界面，点击磁贴即可自动识别并通知结果",
+                                Text("点磁贴后滑出控制面板，在取件码界面稍候，自动识别并通知结果",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.primary,
                                     fontWeight = FontWeight.Medium)
                             } else {
-                                Text("开启后点快捷设置磁贴即可自动识别屏幕上的取餐码/取件码",
+                                Text(
+                                    if (accessibilityEnabledInSettings)
+                                        "系统设置里已开启，但服务实际未在运行——大概率被系统省电策略关闭了。点下方按钮到设置页把「码上闪记」关掉再打开一次。"
+                                    else "开启后点快捷设置磁贴即可自动识别屏幕上的取餐码/取件码",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                                 Spacer(Modifier.height(8.dp))
-                                Button(onClick = onEnableAccessibility) { Text("去开启") }
+                                Button(onClick = onEnableAccessibility) { Text(if (accessibilityEnabledInSettings) "去重新开启" else "去开启") }
                             }
                         }
                     }
@@ -304,6 +321,9 @@ fun HomeScreen(
                             Column {
                                 Spacer(Modifier.height(6.dp))
                                 Text("·从短信/聊天 App 分享", style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("（在短信/聊天里长按选中文字或点分享 → 选「码上闪记」）",
+                                    style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text("·点右下角 ➕ 手动粘贴", style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -341,7 +361,9 @@ fun HomeScreen(
                 }
             }
 
-            // 去重提示
+            // 去重入口：有重复时才显示（用户要求：无重复时不显示）。
+            // 注意：H6 起保存走 saveOrUpdate（同码+同类型自动合并成一行），新识别不产生重复行，
+            // 只有历史遗留的重复组（或手动产生的）才会让入口出现；清理完后入口自动隐藏。
             if (dedupCount > 0) {
                 item {
                     Card(
@@ -425,6 +447,14 @@ fun HomeScreen(
                     }
                 }
             }
-        }
+            }  // LazyColumn 结束
+            // 顶部提示层：画在列表之上，固定在界面上方（顶部栏之下）
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+            )
+        }  // Box 结束
     }
 }

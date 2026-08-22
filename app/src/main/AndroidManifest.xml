@@ -101,7 +101,7 @@
         <service
             android:name=".service.VolumeKeyShortcutService"
             android:exported="true"
-            android:label="码上闪记（音量键快捷识别）"
+            android:label="码上闪记（音量键快捷方式）"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
