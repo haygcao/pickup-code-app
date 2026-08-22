@@ -16,6 +16,10 @@ object CodeValidator {
     internal val LETTER_TWO_SEGMENT_PARCEL = Regex("(?<![\\dA-Za-z])([A-Z])-(\\d{1,2})-(\\d{3,4})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
     internal val LETTER_DASH_FIVE_PARCEL = Regex("(?<![\\dA-Za-z])([A-Za-z])-?(\\d{5,6})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
     internal val LONG_NUMBER_PARCEL = Regex("(?<![\\dA-Za-z])(\\d{6,8})(?![\\dA-Za-z])")
+    /** 兔喜生活/妈妈驿站式单段码：柜架组号-码（如 5-3858、12-3456）。
+     *  注意：必须与 VALID_CODE_FORMATS 全串白名单一致；评分低（60），
+     *  同屏存在更强段式码时会被 top×0.75 过滤，避免把 "1-6-5020" 的子串 "6-5020" 误抓成码。 */
+    internal val DIGIT_DASH_PARCEL = Regex("(?<![\\dA-Za-z])(\\d{1,2})-(\\d{3,5})(?![\\dA-Za-z])")
 
     private const val PATTERN_PREFIXED = "PREFIXED_CODE"
 
@@ -59,6 +63,8 @@ object CodeValidator {
      * 供 AI 提取结果过滤噪声（AI 不比正则可靠，需格式白名单把关）。
      * 增强版（参考同类产品实现 isValidPickupCode 的 11 项过滤）：先做格式匹配，
      * 再做内容排除（全零全一/递增序列/4连重复/xxx/手机号/拼音噪声等）。
+     * 注意：此为**无上下文**校验，2-3 位纯数字一律拒绝（42/123 裸数字噪声）；
+     * 带"取餐码/取件码"强前缀的短码请用 CodeExtractor 的上下文校验路径。
      */
     fun isValidPickupCode(code: String): Boolean {
         val c = code.trim()
@@ -66,25 +72,34 @@ object CodeValidator {
         // 第一步：格式白名单匹配（原有检查）
         if (!VALID_CODE_FORMATS.any { it.matches(c) }) return false
         // 第二步：内容排除（参考同类产品，过滤噪声数字模式）
+        return !isContentNoise(c)
+    }
+
+    /**
+     * 内容噪声检查（与格式无关）：全零全一 / 递增序列 / 4 连重复 / xxx / 手机号子串 / 拼音噪声等。
+     * 拆出供强前缀上下文路径复用（取餐码 123 这类短码跳过格式白名单但必须过内容检查）。
+     */
+    internal fun isContentNoise(code: String): Boolean {
+        val c = code.trim()
         val stripped = c.replace("-", "").replace(" ", "")
         val len = stripped.length
-        if (len < 2 || len > 20) return false
+        if (len < 2 || len > 20) return true
         // 86 开头手机号子串
-        if (stripped.startsWith("86") && stripped.length in 8..13) return false
+        if (stripped.startsWith("86") && stripped.length in 8..13) return true
         // 全 0 或全 1
-        if (stripped.all { it == '0' } || stripped.all { it == '1' }) return false
+        if (stripped.all { it == '0' } || stripped.all { it == '1' }) return true
         // 递增数字序列（0123 ~ 7890）——全串精确匹配，不用子串 contains 避免误杀（如 10123 包含 0123）
-        if (stripped.length == 4 && INCREMENTING_DIGITS.contains(stripped)) return false
+        if (stripped.length == 4 && INCREMENTING_DIGITS.contains(stripped)) return true
         // 递增字母序列（abcd ~ wxyz）——同样全串精确匹配
         val lower = stripped.lowercase()
-        if (lower.length == 4 && INCREMENTING_LETTERS.contains(lower)) return false
+        if (lower.length == 4 && INCREMENTING_LETTERS.contains(lower)) return true
         // 含"手机/电话/时间"拼音噪声
-        if (listOf("手机", "电话", "时间", "shouji", "dianhua", "shijian").any { lower.contains(it) }) return false
+        if (listOf("手机", "电话", "时间", "shouji", "dianhua", "shijian").any { lower.contains(it) }) return true
         // 4 连重复字符（aaaa、1111）
-        if (Regex("(.)\\1{3,}").containsMatchIn(stripped)) return false
+        if (Regex("(.)\\1{3,}").containsMatchIn(stripped)) return true
         // xxx 模式（占位/噪声）
-        if (Regex("[xX]{3,}").containsMatchIn(stripped)) return false
-        return true
+        if (Regex("[xX]{3,}").containsMatchIn(stripped)) return true
+        return false
     }
 
     // 合法取件/取餐码格式白名单（与上方解析正则一一对应，去锚点/去分组后用于全串匹配）
@@ -95,6 +110,7 @@ object CodeValidator {
         Regex("[A-Za-z]-?\\d{5,6}"),                                  // LETTER_DASH_FIVE
         Regex("[A-Za-z]\\d{1,2}-\\d{1,2}-\\d{3,6}", RegexOption.IGNORE_CASE), // LETTER_THREE_SEG
         Regex("[A-Za-z]-\\d{3,4}", RegexOption.IGNORE_CASE),          // LETTER_DASH_THREE
+        Regex("\\d{1,2}-\\d{3,5}"),                                     // DIGIT_DASH_PARCEL 兔喜式（5-3858）
         Regex("\\d{6,8}"),                                            // LONG_NUMBER
         Regex("[A-Z]\\s*-?\\s*\\d{2,4}", RegexOption.IGNORE_CASE),  // LETTER_NUMBER_FOOD
         // PURE_NUMBER_FOOD：手动/AI 校验无上下文，收紧为 4-5 位，避免 2-3 位裸数字(42/123)被当合法码
@@ -123,6 +139,7 @@ object CodeValidator {
         "LETTER_TWO_SEGMENT_PARCEL" to LETTER_TWO_SEGMENT_PARCEL,
         "LETTER_DASH_FIVE_PARCEL" to LETTER_DASH_FIVE_PARCEL,
         "LONG_NUMBER_PARCEL" to LONG_NUMBER_PARCEL,
+        "DIGIT_DASH_PARCEL" to DIGIT_DASH_PARCEL,
     )
 
     internal fun classifyFormat(code: String): String {

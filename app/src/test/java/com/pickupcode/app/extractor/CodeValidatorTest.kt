@@ -20,6 +20,14 @@ class CodeValidatorTest {
     }
 
     @Test
+    @DisplayName("valid 兔喜式单段码 (5-3858 / 12-3456)")
+    fun valid_digitDashSegment() {
+        assertTrue(CodeValidator.isValidPickupCode("5-3858"))
+        assertTrue(CodeValidator.isValidPickupCode("12-3456"))
+        assertTrue(CodeValidator.isValidPickupCode("8-2014"))
+    }
+
+    @Test
     @DisplayName("valid long number")
     fun valid_longNumber() {
         assertTrue(CodeValidator.isValidPickupCode("281849"))
@@ -52,6 +60,16 @@ class CodeValidatorTest {
     }
 
     @Test
+    @DisplayName("isContentNoise：短码内容噪声检查可复用（123 非噪声，000/1234 递增是噪声）")
+    fun contentNoise() {
+        assertFalse(CodeValidator.isContentNoise("123"))
+        assertTrue(CodeValidator.isContentNoise("000"))
+        assertTrue(CodeValidator.isContentNoise("0000"))
+        assertTrue(CodeValidator.isContentNoise("1234"))
+        assertTrue(CodeValidator.isContentNoise("1111"))
+    }
+
+    @Test
     @DisplayName("accepts 4-5 digit pure number as food code")
     fun valid_pureNumberFood() {
         assertTrue(CodeValidator.isValidPickupCode("2024"))
@@ -77,5 +95,6 @@ class CodeValidatorTest {
         assertEquals("THREE_SEGMENT_PARCEL", CodeValidator.getPatternId("1-6-5020"))
         assertEquals("LONG_NUMBER_PARCEL", CodeValidator.getPatternId("281849"))
         assertEquals("PREFIXED_CODE", CodeValidator.getPatternId("ABC"))
+        assertEquals("DIGIT_DASH_PARCEL", CodeValidator.getPatternId("5-3858"))
     }
 }

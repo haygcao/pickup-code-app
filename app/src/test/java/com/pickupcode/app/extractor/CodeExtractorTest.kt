@@ -73,6 +73,40 @@ class CodeExtractorTest {
     }
 
     @Test
+    @DisplayName("强前缀放行 3 位纯数字取餐码（取餐码123）")
+    fun extract_prefixedShortPure() {
+        val r = CodeExtractor.extract(listOf(line("【蜜雪冰城】取餐码123，请到柜台取餐")))
+        assertTrue(r.isNotEmpty(), "应提取出取餐码")
+        assertEquals("123", r.first().code)
+        assertEquals(CodeExtractor.CodeType.pickup_food, r.first().type)
+    }
+
+    @Test
+    @DisplayName("无前缀裸 3 位数字仍拒绝（123 不当作码）")
+    fun extract_bareShortPureRejected() {
+        val r = CodeExtractor.extract(listOf(line("订单金额 123 元")))
+        assertTrue(r.isEmpty(), "裸数字 123 不应被提取")
+    }
+
+    @Test
+    @DisplayName("提取兔喜式单段码（取件码为5-3858）")
+    fun extract_tuxiDigitDash() {
+        val r = CodeExtractor.extract(listOf(
+            line("【兔喜生活】您有包裹已到达育新路北段店，取件码为5-3858，地址:育新路北段爱玛电动车旁边")
+        ))
+        assertTrue(r.isNotEmpty(), "应提取出取件码")
+        assertEquals("5-3858", r.first().code)
+        assertEquals(CodeExtractor.CodeType.pickup_parcel, r.first().type)
+    }
+
+    @Test
+    @DisplayName("三段式码的子串不会被兔喜规则误抓（1-6-5020 不应同时产出 6-5020）")
+    fun extract_noSubstringDup() {
+        val r = CodeExtractor.extract(listOf(line("【菜鸟驿站】您的取件码 1-6-5020 已到")))
+        assertEquals(listOf("1-6-5020"), r.map { it.code })
+    }
+
+    @Test
     @DisplayName("无码文本返回空列表")
     fun extract_none() {
         assertTrue(CodeExtractor.extract(emptyList()).isEmpty())
