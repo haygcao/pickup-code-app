@@ -1,5 +1,6 @@
 package com.pickupcode.app.extractor
 
+import com.pickupcode.app.BuildConfig
 import com.pickupcode.app.ocr.OCREngine
 
 /** 地址提取：从 OCR 行流中定位站点名/柜号/完整取件地址（自 CodeExtractor 拆出，R1）。
@@ -12,10 +13,11 @@ object AddressExtractor {
         val stationName: String,
         val stationType: StationType,
         val cabinetNumber: String?,
-        val fullAddress: String
+        val fullAddress: String,
+        val addrFrom: String = "none"  // 命中步骤来源（竞争仲裁用；12 个来源值）
     )
 
-    // 地址指示符（isAddressLike 核心判断）：合并反编译 App sources extractAddress 的 30+ 地标词表，
+    // 地址指示符（isAddressLike 核心判断）：合并同类产品 extractAddress 的 30+ 地标词表，
     // 覆盖 店/铺/站/点/园/苑/广场/中心/公寓/写字楼 等常见地址结尾，减少 S10 兜底漏抓真实地址。
     // 注意保留"元"仅在"单元"语境（见 isAddressLike 的 bareYuanOnly 处理）。
     private val ADDR_PIPE_FULL = Regex("[路街巷弄号栋幢单元柜室楼区县镇乡村庄店铺站点园苑院屋所广场中心商厦厦居宅房寓庭墅阁舍江河港湾门口岸桥山岭岗场]")
@@ -29,6 +31,9 @@ object AddressExtractor {
     private val REG_CJK_BRAND_LEAD = Regex("[\\u4e00-\\u9fff]{2,10}")
     // 「地址:」标签标记（S0b 与 extractAddressForCode 共用）
     private val REG_ADDR_LABEL_MARK = Regex("地址[:：]")
+
+    /** 快递运单号行（品牌+快递后缀+冒号/空格+长数字串），如 中通快递:79130792811022——非地址。 */
+    private val COURIER_TRACKING_LINE = Regex("(?:快递|速递|物流|速运|驿站|智能柜)[:：]?\\s*\\d{9,}")
 
     // ---------------------------------------------------------------
     // 长度/几何容差常量（各步骤共用，按语义分开命名）
@@ -587,14 +592,26 @@ object AddressExtractor {
         st.stationName = extractStationName(allText)
     }
 
-    android.util.Log.d("CodeExtrDiag",
-        "ADDR=full=[${st.fullAddress}] from=[${st.addrFrom}] station=[${st.stationName}] cabinet=[${st.cabinet}] type=[$stype] allText=" + allText)
+    if (BuildConfig.DEBUG) {
+        android.util.Log.d("CodeExtrDiag",
+            "ADDR=full=[${st.fullAddress}] from=[${st.addrFrom}] station=[${st.stationName}] cabinet=[${st.cabinet}] type=[$stype] allText=" + allText)
+        // 调试快照：地址结果（与码候选同屏展示）
+        RecognitionDebugStore.captureAddress(
+            RecognitionDebugStore.AddressInfo(
+                fullAddress = st.fullAddress,
+                station = st.stationName,
+                cabinet = st.cabinet,
+                from = st.addrFrom
+            )
+        )
+    }
 
     return PickupLocation(
         stationName = st.stationName.ifEmpty { "未知站点" },
         stationType = stype,
         cabinetNumber = st.cabinet,
-        fullAddress = st.fullAddress
+        fullAddress = st.fullAddress,
+        addrFrom = st.addrFrom
     )
     }
 
@@ -692,7 +709,51 @@ object AddressExtractor {
         return extractLocation(lines, allText).fullAddress
     }
 
-    /** 增强版：context 非空时优先匹配用户常用站点（借鉴反编译 App setCommonStations）。 */
+    // ---------------------------------------------------------------
+    // 竞争仲裁（渐进版，2026-08-13）：窗口地址优先；全屏地址仅高置信来源采信
+    // 背景：步骤制"先到先得"的结构性弱点——S7/S8/S9/S10 几何兜底可能在多通知
+    // 同屏时抓到别的通知的地址（串台）。复审规则：码窗口内的地址无条件优先；
+    // 窗口无地址时，全屏结果只有来自「文本证据型」步骤（S0/S0b/S0c/S2/S5/S6/
+    // S-Coupon）才采信，几何兜底型（S7/S8/S9/S10）在多码同屏时宁缺毋滥。
+    // ---------------------------------------------------------------
+
+    /** 文本证据型步骤（标签/句式直接写明地址）——高置信，全屏采信。 */
+    private val HIGH_CONFIDENCE_SOURCES = setOf(
+        "SCoupon-store", "S0-label", "S0b-addrLabel", "S0c-column",
+        "S2-pipe", "S5-placed", "S6a", "S6b"
+    )
+
+    /**
+     * 竞争仲裁：合并窗口地址与全屏地址。
+     * @param perCodeAddr [extractAddressForCode] 的窗口定位结果（可能为空）
+     * @param fullAddress 全屏 [extractLocation] 的兜底结果（可能为空）
+     * @param multiCodeOnScreen 是否多码同屏。多码时几何兜底型来源（S7~S10）可能抓到别的
+     *   通知的地址（串台），仅采信文本证据型来源，宁缺毋滥；单码时全屏地址必然属于本卡，
+     *   几何兜底照常采信。
+     * @return 最终地址；窗口地址优先，全屏按上述规则采信
+     */
+    fun resolveAddress(
+        lines: List<OCREngine.TextLine>,
+        allText: String,
+        perCodeAddr: String,
+        fullAddress: String,
+        multiCodeOnScreen: Boolean = false
+    ): String {
+        if (perCodeAddr.isNotBlank()) return perCodeAddr
+        if (fullAddress.isBlank()) return ""
+        if (!multiCodeOnScreen) return fullAddress
+        val loc = extractLocation(lines, allText)
+        return if (loc.addrFrom in HIGH_CONFIDENCE_SOURCES) fullAddress else ""
+    }
+
+    /**
+     * 全屏地址是否为高置信文本证据来源（竞争仲裁判定，供管线复用）。
+     * 多码同屏时外层只需调用一次，避免每个码重复全量 [extractLocation] 扫描。
+     */
+    fun isHighConfidenceFullAddress(lines: List<OCREngine.TextLine>, allText: String): Boolean =
+        extractLocation(lines, allText).addrFrom in HIGH_CONFIDENCE_SOURCES
+
+    /** 增强版：context 非空时优先匹配用户常用站点（参考同类产品实现 setCommonStations）。 */
     fun extractAddress(lines: List<OCREngine.TextLine>, allText: String, context: android.content.Context?): String {
         if (context == null) return extractAddress(lines, allText)
         val commonStations = com.pickupcode.app.learner.CommonStationStore.getCommonStations(context)
@@ -707,7 +768,7 @@ object AddressExtractor {
     }
 
     /**
-     * 独立柜号提取（借鉴反编译 App extractCabinetInfo）：从取件文本里抓柜号/格口，
+     * 独立柜号提取（参考同类产品实现 extractCabinetInfo）：从取件文本里抓柜号/格口，
      * 如 2号柜、5号副柜、云柜12号、12号格口、A区3号柜。返回规范化串（含"柜/格口"后缀），
      * 无则空串。供入库时作为独立 cabinetNumber 字段保存（区别于拼进地址尾部）。
      */
@@ -840,6 +901,9 @@ object AddressExtractor {
         if (listOf("件码", "取件码", "取货码", "提取码", "取餐码", "取单码").any { t.contains(it) }) return false
         // Exclude 运单号/单号 标签（如 OCR 误写的 快谨单号）——不是取件地址
         if (t.endsWith("单号") || listOf("运单号", "订单号", "快运单号", "快递单号").any { t.contains(it) }) return false
+        // Exclude 快递运单号行："品牌+快递后缀+冒号/空格+长数字串"（如 中通快递:79130792811022）
+        // 这是快递详情页的运单号行，绝不可能是指件地址；真实地址不会带"快递:9位以上纯数字"。
+        if (COURIER_TRACKING_LINE.containsMatchIn(t)) return false
         // Exclude 订单/交易/UI 界面标签（如 OCR 把「订单详情」读成 订单详惰、交易快照、券号/券码等）——不是取件地址
         // 「商品」单独排除会误杀真实地址「商品街」（如 育新路商品街），仅当不含「商品街」时才排除
         if (listOf("订单", "交易", "快照", "详惰", "详情页", "规格", "小计", "合计", "数量", "券码", "券号").any { t.contains(it) } ||

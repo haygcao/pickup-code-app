@@ -5,9 +5,9 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
+import com.pickupcode.app.BuildConfig
 import com.pickupcode.app.data.AppDatabase
 import com.pickupcode.app.data.CodeHistory
 import com.pickupcode.app.extractor.AIExtractor
@@ -19,15 +19,15 @@ import com.pickupcode.app.geocoder.GeocoderVerifier
 import com.pickupcode.app.kuaidi100.Kuaidi100Verifier
 import com.pickupcode.app.ocr.OCREngine
 import com.pickupcode.app.preferences.AppPreferences
+import com.pickupcode.app.service.PostVerifier
 import com.pickupcode.app.service.RecognitionPipeline
+import com.pickupcode.app.util.ImageUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileOutputStream
 
 object ShareReceiver {
 
@@ -212,7 +212,13 @@ object ShareReceiver {
     fun handle(context: Context, intent: Intent?, scope: CoroutineScope) {
         if (intent == null) return
         val action = intent.action
-        if (action != Intent.ACTION_SEND && action != Intent.ACTION_PROCESS_TEXT) return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_PROCESS_TEXT && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        // 多图分享暂不支持：明确提示一条通知，不再静默丢弃无感知
+        if (action == Intent.ACTION_SEND_MULTIPLE) {
+            showMultiShareHint(context)
+            return
+        }
 
         scope.launch {
             val settings = withContext(Dispatchers.IO) {
@@ -271,32 +277,17 @@ object ShareReceiver {
     ) {
         val bitmap = withContext(Dispatchers.IO) {
             try {
-                decodeSampledBitmap(context, uri)
+                ImageUtils.decodeSampledBitmap(context, uri)
             } catch (e: Exception) {
                 Log.e(TAG, "Read image failed: ${e.message}")
                 null
             }
         } ?: return
 
-        // Save shared image as screenshot for detail page
-        val screenshotPath = withContext(Dispatchers.IO) {
-            try {
-                val dir = File(context.cacheDir, "shared_images")
-                dir.mkdirs()
-                val file = File(dir, "share_${System.currentTimeMillis()}.jpg")
-                FileOutputStream(file).use { out ->
-                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
-                }
-                file.absolutePath
-            } catch (e: Exception) {
-                Log.e(TAG, "Save screenshot failed: ${e.message}")
-                ""
-            }
-        }
-
         // OCR + 券码检测（都在 recycle 前用同一张 bitmap）
         var lines: List<OCREngine.TextLine> = emptyList()
         var coupons: List<CouponDetector.CouponResult> = emptyList()
+        var ocrError = false
         withContext(Dispatchers.Default) {
             try {
                 lines = OCREngine.recognize(bitmap)
@@ -305,14 +296,28 @@ object ShareReceiver {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "OCR failed", e)
-            } finally {
-                if (!bitmap.isRecycled) bitmap.recycle()
+                ocrError = true
             }
         }
-        if (lines.isEmpty() && coupons.isEmpty()) {
-            Log.w(TAG, "分享图片识别无结果——OCR和条码检测均未返回内容")
+        if ((lines.isEmpty() && coupons.isEmpty()) || ocrError) {
+            // 识别无结果时不落盘截图：先识别后存图，避免空结果也产生孤儿 JPEG
+            // （与无障碍路径「识别成功后才保存」行为一致）
+            if (!bitmap.isRecycled) bitmap.recycle()
+            if (lines.isEmpty() && coupons.isEmpty()) {
+                Log.w(TAG, "分享图片识别无结果——OCR和条码检测均未返回内容")
+            }
             return
         }
+
+        // 识别到结果才保存共享图片（详情页截图用）
+        val screenshotPath = try {
+            withContext(Dispatchers.IO) {
+                ImageUtils.saveJpeg(context, "shared_images", "share", bitmap)
+            }
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+
         val allText = lines.joinToString(" ") { it.text }
         val address = AddressExtractor.extractAddress(lines, allText)
         val snippet = "$sourceLabel | ${lines.joinToString(" ") { it.text }}"
@@ -334,7 +339,7 @@ object ShareReceiver {
         val allText = lines.joinToString(" ") { it.text }
 
         // 金融/支付噪音拦截：银行/支付/转账等通知截图里的数字（金额/验证码/余额）极易被当取件码。
-        // 命中金融词且无快递/取件信号词 → 整段不识别。（借鉴反编译 App isExpressRelatedSms）
+        // 命中金融词且无快递/取件信号词 → 整段不识别。（参考同类产品实现 isExpressRelatedSms）
         if (CodeExtractor.isFinancialNoise(allText)) {
             Log.d(TAG, "金融/支付噪音文本，跳过识别")
             return
@@ -360,8 +365,23 @@ object ShareReceiver {
         if (!hasCoupon) {
             // 正则主路径先行（问题3：分享路径接入 AI，但不阻塞）
             val regexResults = withContext(Dispatchers.Default) { CodeExtractor.extract(lines, context = context, source = "share") }
+            // 诊断日志（候选码值/来源/阈值属 PII，仅 DEBUG 输出；release 不落）
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, "正则提取结果 ${regexResults.size} 条，置信度阈值=${settings.confidenceThreshold}，" +
+                    "取件=${settings.enableParcelCodes}/取餐=${settings.enableFoodCodes}/券=${settings.enableCouponCodes}")
+            }
             for (re in regexResults) {
-                if (re.confidence >= settings.confidenceThreshold && !isTypeDisabled(re.type, settings)) {
+                val confOk = re.confidence >= settings.confidenceThreshold
+                val typeOk = !isTypeDisabled(re.type, settings)
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "正则候选 code=${re.code} type=${re.type} conf=${re.confidence} " +
+                        "src=${re.source} → confOK=$confOk typeOK=$typeOk " +
+                        if (confOk && typeOk) "【通过】" else "【被拒：${buildString {
+                            if (!confOk) append("置信度${re.confidence}<阈值${settings.confidenceThreshold};")
+                            if (!typeOk) append("类型${re.type}已关闭;")
+                        }}】")
+                }
+                if (confOk && typeOk) {
                     allResults.add(re)
                 }
             }
@@ -374,6 +394,10 @@ object ShareReceiver {
                 try {
                     val aiRes = aiDeferred.await()
                     if (aiRes.error != null) Log.w(TAG, "AI 识别失败: ${aiRes.error}")
+                    if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "AI 识别返回 ${aiRes.results.size} 条: " +
+                            aiRes.results.joinToString { "${it.code}(${it.type})" })
+                    }
                     for (ai in aiRes.results) {
                         if (isTypeDisabled(ai.type, settings)) continue
                         if (allResults.any { it.code == ai.code && it.type == ai.type }) continue // 同码同type去重
@@ -385,11 +409,13 @@ object ShareReceiver {
                 } catch (e: Exception) {
                     Log.w(TAG, "AI 结果合并异常: ${e.message}")
                 }
+            } else {
+                Log.d(TAG, "AI 识别未启用（enableAI=${settings.enableAI}, apiKey非空=${settings.apiKey.isNotBlank()}），跳过")
             }
         }
 
         if (allResults.isEmpty()) {
-            Log.d(TAG, "No pickup code found")
+            Log.d(TAG, "最终识别结果为空 —— 正则与 AI 均未产出可入库的码（详见上方逐条候选日志）")
             return
         }
 
@@ -421,22 +447,11 @@ object ShareReceiver {
             for (s in saved) {
                 scope.launch(Dispatchers.IO) {
                     try {
-                        val geoResult = GeocoderVerifier.verify(
-                            context, address,
-                            amapApiKey = settings.amapApiKey.ifBlank { null }
-                        )
-                        if (geoResult.verified) {
-                            // M1: 定向更新 geo 字段，不动 code/address 等其他字段，避免覆盖用户编辑
-                            db.repository.findByCodeAndType(s.code, s.type.name)?.let { rec ->
-                                db.repository.updateGeo(
-                                    rec.id, true,
-                                    geoResult.confidence,
-                                    geoResult.formattedAddress ?: ""
-                                )
+                        PostVerifier.verifyMap(context, address, settings.amapApiKey.ifBlank { null }) { conf, fmtAddr ->
+                            // 定向更新本次保存的 id（同码同类型并发新保存时 findByCodeAndType 会命中错误行）
+                            savedIdsByCode[s.code]?.let { id ->
+                                db.repository.updateGeo(id, true, conf, fmtAddr ?: "")
                             }
-                            Log.d(TAG, "Geo verify OK: $address -> ${geoResult.formattedAddress} (${geoResult.confidence})")
-                        } else {
-                            Log.d(TAG, "Geo verify failed for: $address")
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "Geo verify error: ${e.message}")
@@ -451,29 +466,22 @@ object ShareReceiver {
             if (trackingNum != null) {
                 scope.launch(Dispatchers.IO) {
                     try {
-                        val res = Kuaidi100Verifier.query(settings.kuaidi100Key, trackingNum, Kuaidi100Verifier.guessCourierCode(trackingNum))
-                        Log.d(TAG, "Kuaidi100 verify: success=${res.success} code=${res.pickUpCode} address=${res.pickUpAddress} err=${res.errorMsg}")
-                        if (res.success && res.pickUpCode != null) {
-                            val ocrCodes = allResults.map { it.code }
-                            if (ocrCodes.contains(res.pickUpCode)) {
-                                Log.d(TAG, "Kuaidi100 confirm: OCR码 ${res.pickUpCode} 与 API 一致 ✓")
-                            } else {
-                                Log.d(TAG, "Kuaidi100 mismatch: OCR=${ocrCodes}, API=${res.pickUpCode}")
-                            }
-                            if (res.pickUpAddress.isNullOrBlank().not()) {
-                                // Low-3: 优先定向更新本次保存的记录（同码可能有多行历史，findByCodeAndType 会命中错误行）
-                                val targetId = savedIdsByCode[res.pickUpCode]
-                                if (targetId != null) {
-                                    db.codeHistoryDao().getByIdSuspend(targetId)?.let { rec ->
-                                        if (rec.pickupAddress.isBlank()) {
-                                            db.codeHistoryDao().update(rec.copy(pickupAddress = res.pickUpAddress))
-                                        }
-                                    }
-                                } else {
-                                    val rec = db.codeHistoryDao().findByCodeAndType(res.pickUpCode, CodeExtractor.CodeType.pickup_parcel.name)
-                                    if (rec != null && rec.pickupAddress.isBlank()) {
+                        val res = PostVerifier.verifyKuaidi100(context, settings.kuaidi100Key, trackingNum, allResults.map { it.code })
+                            ?: return@launch
+                        val pCode = res.pickUpCode ?: return@launch
+                        if (res.pickUpAddress.isNullOrBlank().not()) {
+                            // Low-3: 优先定向更新本次保存的记录（同码可能有多行历史，findByCodeAndType 会命中错误行）
+                            val targetId = savedIdsByCode[pCode]
+                            if (targetId != null) {
+                                db.codeHistoryDao().getByIdSuspend(targetId)?.let { rec ->
+                                    if (rec.pickupAddress.isBlank()) {
                                         db.codeHistoryDao().update(rec.copy(pickupAddress = res.pickUpAddress))
                                     }
+                                }
+                            } else {
+                                val rec = db.codeHistoryDao().findByCodeAndType(pCode, CodeExtractor.CodeType.pickup_parcel.name)
+                                if (rec != null && rec.pickupAddress.isBlank()) {
+                                    db.codeHistoryDao().update(rec.copy(pickupAddress = res.pickUpAddress))
                                 }
                             }
                         }
@@ -492,43 +500,32 @@ object ShareReceiver {
         CodeExtractor.CodeType.coupon -> !settings.enableCouponCodes
     }
 
-    /**
-     * 降采样解码分享图片：先读尺寸按 inSampleSize 缩放，避免 4000×3000 全尺寸解码 OOM。
-     * minSdk 26 < 28：ImageDecoder（自动应用 EXIF 旋转）不可用，保留 BitmapFactory + 手动读 EXIF 旋转。
-     */
-    private fun decodeSampledBitmap(context: Context, uri: Uri): Bitmap? {
-        // 第一遍：只读边界拿尺寸（不分配像素）
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-
-        // 计算采样倍数：目标最长边 ~1600px（OCR 分辨率足够，兼顾内存）。
-        // Medium-3: 原 while (dim / 2 >= 1600) 在 dim∈[1600,3200) 区间不降采样，改为按最长边直接判定
-        var sample = 1
-        var dim = maxOf(bounds.outWidth, bounds.outHeight)
-        while (dim >= 1600) { sample *= 2; dim /= 2 }
-
-        val opts = BitmapFactory.Options().apply {
-            inSampleSize = sample
+    /** 多图分享提示（ACTION_SEND_MULTIPLE 暂不支持逐张处理，明确告知用户）。 */
+    private fun showMultiShareHint(context: Context) {
+        // Android 13+ 无通知权限时静默（与主通知路径一致）
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
         }
-        val bmp = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
-            ?: return null
-
-        // 手动应用 EXIF 旋转（相册直出的竖拍图带 Orientation，不旋转会歪 90°/左右颠倒）
-        return try {
-            val rotation = context.contentResolver.openInputStream(uri)?.use {
-                androidx.exifinterface.media.ExifInterface(it).rotationDegrees
-            } ?: 0
-            if (rotation == 0) {
-                bmp
-            } else {
-                val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
-                val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                if (rotated !== bmp) bmp.recycle()
-                rotated
-            }
-        } catch (_: Exception) {
-            bmp
+        try {
+            val nm = context.getSystemService(android.app.NotificationManager::class.java) ?: return
+            nm.createNotificationChannel(android.app.NotificationChannel(
+                "share_hint", "分享提示", android.app.NotificationManager.IMPORTANCE_DEFAULT))
+            nm.notify(
+                "share_multi".hashCode() and 0x7fffffff,
+                androidx.core.app.NotificationCompat.Builder(context, "share_hint")
+                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setContentTitle("码上闪记")
+                    .setContentText("暂不支持多图分享，请一次分享一张图片")
+                    .setAutoCancel(true)
+                    .setTimeoutAfter(5000)
+                    .build()
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "多图提示通知失败: ${e.message}")
         }
     }
 }

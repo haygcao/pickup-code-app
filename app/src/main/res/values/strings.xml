@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">一键闪记</string>
+    <string name="app_name">码上闪记</string>
     <string name="capture_button">截屏识别取餐/取件码</string>
     <string name="permission_button">检查权限</string>
     <string name="no_codes">暂无待取的码</string>
+
+    <!-- 无障碍服务在系统设置列表里的区分说明（两条码上闪记，防开错） -->
+    <string name="a11y_main_summary">主识别服务：截图识别取件码/取餐码，快捷设置磁贴与自动识别都依赖它</string>
+    <string name="a11y_main_description">使用本 App 请开启此项（不带括号的这条）。开启后：①快捷设置磁贴点击识别屏幕；②打开外卖/快递 App 时自动识别。建议同时在系统省电设置里允许本 App 后台运行。</string>
+    <string name="a11y_volume_summary">仅作为系统「无障碍快捷方式」（双音量键）的触发通道</string>
+    <string name="a11y_volume_description">除非你想用「同时按住两个音量键」快捷识别，否则这条保持关闭即可。开启方法：系统设置 → 无障碍 → 无障碍快捷方式 → 选择「码上闪记（音量键快捷方式）」，无需在列表中开启本条。</string>
 </resources>

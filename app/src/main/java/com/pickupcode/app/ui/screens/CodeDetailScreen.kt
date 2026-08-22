@@ -19,6 +19,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -27,7 +28,9 @@ import android.graphics.BitmapFactory
 import com.pickupcode.app.data.CodeHistory
 import com.pickupcode.app.extractor.CodeExtractor
 import com.pickupcode.app.extractor.CodeValidator
+import com.pickupcode.app.learner.CommonStationStore
 import com.pickupcode.app.learner.PatternLearner
+import com.pickupcode.app.ui.components.BrandLogo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -47,12 +50,16 @@ private data class DetailConfirmState(
     val addrIncorrect: Boolean = false
 )
 
+/** 详情页可编辑字段（M20：编辑走定向 UPDATE，避免整行覆盖丢更新）。
+ *  命名用 EditField，避免与下方同名 Composable 函数 EditableField 产生声明冲突。 */
+enum class EditField { CODE, SOURCE, CABINET, ADDRESS }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CodeDetailScreen(
     item: CodeHistory,
     onBack: () -> Unit,
-    onUpdated: (CodeHistory) -> Unit,
+    onUpdateField: (EditField, String) -> Unit,
     onMarkDone: ((Long) -> Unit)? = null
 ) {
     val ctx = LocalContext.current; val scope = rememberCoroutineScope()
@@ -71,7 +78,11 @@ fun CodeDetailScreen(
         }
     }
     LaunchedEffect(loadedConfirmState) {
-        confirmState = loadedConfirmState
+        // 仅在用户尚未交互（confirmState 仍为默认全 false）时回填异步加载的初始值，
+        // 避免加载完成后整份覆盖用户在慢设备上刚点的「确认/标记错误」。
+        if (confirmState == DetailConfirmState()) {
+            confirmState = loadedConfirmState
+        }
     }
 
     Scaffold(
@@ -101,7 +112,7 @@ fun CodeDetailScreen(
             }
 
             EditableField(label = "码值", value = item.code, displayFontSize = 28.sp, displayFontWeight = FontWeight.Bold,
-                onSave = { onUpdated(item.copy(code = it)) })
+                onSave = { onUpdateField(EditField.CODE, it) })
             if (item.isActive) {
                 InlineConfirm("码值正确", confirmed = confirmState.codeConfirmed, incorrect = confirmState.codeIncorrect,
                     onCorrect = {
@@ -127,7 +138,22 @@ fun CodeDetailScreen(
             }
 
             EditableField(label = "来源", value = item.source, displayFontSize = 18.sp,
-                onSave = { onUpdated(item.copy(source = it)) },
+                onSave = { onUpdateField(EditField.SOURCE, it) },
+                leadingIcon = {
+                    // 品牌 logo（未收录的品牌不显示，仅文字）
+                    val lr = BrandLogo.logoRes(item.source, item.shareSourceName, item.shareSourcePkg)
+                    if (lr != null) {
+                        Box(
+                            modifier = Modifier.size(32.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Image(painterResource(lr), contentDescription = item.source,
+                                contentScale = ContentScale.Fit, modifier = Modifier.size(28.dp))
+                        }
+                    }
+                },
                 trailingAction = {
                     // 🚪 跳转来源 App（与取件地址卡的 📍 同布局：右端图标）。仅当有关分享来源显示。
                     if (item.shareSourcePkg.isNotBlank()) {
@@ -157,12 +183,12 @@ fun CodeDetailScreen(
 
             if (item.cabinetNumber.isNotBlank()) {
                 EditableField(label = "柜号", value = item.cabinetNumber, displayFontSize = 16.sp,
-                    onSave = { onUpdated(item.copy(cabinetNumber = it)) })
+                    onSave = { onUpdateField(EditField.CABINET, it) })
             }
 
             if (item.pickupAddress.isNotBlank()) {
                 EditableField(label = "取件地址", value = item.pickupAddress, displayFontSize = 16.sp,
-                    onSave = { onUpdated(item.copy(pickupAddress = it)) },
+                    onSave = { onUpdateField(EditField.ADDRESS, it) },
                     trailingAction = {
                         // 📍 唤起导航：用 geo: URI 让系统地图应用弹出选择（与分享来源卡片的 🚪 同布局：右端图标）
                         IconButton(onClick = { launchNavigation(ctx, item.pickupAddress) }) {
@@ -171,8 +197,8 @@ fun CodeDetailScreen(
                     })
 
                 // C2: 常用取件点提示（IO 线程查，避免组合期主线程解析 JSON）
-                val freqPoint by produceState<PatternLearner.PickupPoint?>(null, item.pickupAddress) {
-                    value = withContext(Dispatchers.IO) { PatternLearner.isFrequentPickupPoint(ctx, item.pickupAddress) }
+                val freqPoint by produceState<CommonStationStore.PickupPoint?>(null, item.pickupAddress) {
+                    value = withContext(Dispatchers.IO) { CommonStationStore.isFrequentPickupPoint(ctx, item.pickupAddress) }
                 }
                 val freq = freqPoint  // 捕获局部值，便于智能转换
                 if (freq != null) {
@@ -308,7 +334,7 @@ fun CodeDetailScreen(
                         confirmAll()
                         // C2: 标记已取时把取件地址登记为常用取件点（IO 线程写盘，避免主线程同步 IO）
                         if (item.pickupAddress.isNotBlank()) {
-                            scope.launch(Dispatchers.IO) { PatternLearner.registerPickupPoint(ctx, item.pickupAddress) }
+                            scope.launch(Dispatchers.IO) { CommonStationStore.registerPickupPoint(ctx, item.pickupAddress) }
                         }
                         onMarkDone(item.id)
                     }, modifier = Modifier.fillMaxWidth(),
@@ -365,6 +391,7 @@ private fun InlineConfirm(label: String, confirmed: Boolean, incorrect: Boolean,
 @Composable
 private fun EditableField(label: String, value: String, displayFontSize: androidx.compose.ui.unit.TextUnit,
                           displayFontWeight: FontWeight? = null, onSave: (String) -> Unit,
+                          leadingIcon: (@Composable () -> Unit)? = null,
                           trailingAction: (@Composable () -> Unit)? = null) {
     var editing by remember { mutableStateOf(false) }
     var editedValue by remember(value) { mutableStateOf(value) }
@@ -375,6 +402,12 @@ private fun EditableField(label: String, value: String, displayFontSize: android
             Modifier.padding(16.dp).fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // 前置图标（如：来源行的品牌 logo），可空则不占位
+            if (leadingIcon != null) {
+                Box(Modifier.padding(end = 12.dp), contentAlignment = Alignment.Center) {
+                    leadingIcon()
+                }
+            }
             Column(Modifier.weight(1f)) {
                 Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(4.dp))

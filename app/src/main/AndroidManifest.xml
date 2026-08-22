@@ -10,7 +10,7 @@
         android:name=".App"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="一键闪记"
+        android:label="码上闪记"
         android:supportsRtl="true"
         android:theme="@style/Theme.PickupCode">
 
@@ -33,6 +33,13 @@
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+
+            <!-- 多图分享（ACTION_SEND_MULTIPLE）：进入后给提示，避免静默丢弃无感知 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="image/*" />
             </intent-filter>
@@ -75,18 +82,33 @@
 
         <receiver
             android:name=".notification.RemindReceiver"
-            android:exported="false" />
+            android:exported="false"
+            android:directBootAware="true" />
 
         <!-- Quick Settings tile -->
         <service
             android:name=".service.PickupCodeTileService"
             android:exported="true"
             android:icon="@drawable/ic_tile_pickup"
-            android:label="一键闪记"
+            android:label="码上闪记"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
+        </service>
+
+        <!-- 双音量键快捷触发（系统无障碍快捷方式通道；触发即退出，不常驻） -->
+        <service
+            android:name=".service.VolumeKeyShortcutService"
+            android:exported="true"
+            android:label="码上闪记（音量键快捷方式）"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/volume_key_shortcut_config" />
         </service>
 
         <!-- 短信取件码自动识别（SMS_RECEIVED 广播；需 RECEIVE_SMS 权限） -->

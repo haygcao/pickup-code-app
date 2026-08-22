@@ -26,6 +26,10 @@ interface CodeHistoryDao {
     @Query("SELECT * FROM code_history WHERE code = :code AND type = :type AND isActive = 1 ORDER BY timestamp DESC LIMIT 1")
     suspend fun findByCodeAndType(code: String, type: String): CodeHistory?
 
+    /** 到期提醒复查：该码是否仍有活跃记录（提醒发出前调用，已取则不再打扰）。 */
+    @Query("SELECT COUNT(*) FROM code_history WHERE code = :code AND type = :type AND isActive = 1")
+    suspend fun countActiveByCodeAndType(code: String, type: String): Int
+
     /** 查同 code 不同类型的记录（重复值检测） */
     @Query("SELECT * FROM code_history WHERE code = :code AND type != :type AND isActive = 1 ORDER BY timestamp DESC")
     suspend fun findSameCodeDifferentType(code: String, type: String): List<CodeHistory>
@@ -47,6 +51,16 @@ interface CodeHistoryDao {
     /** 定向更新 pickupAddress（Kuaidi100 回填，避免整行 update 覆盖中间用户操作）。 */
     @Query("UPDATE code_history SET pickupAddress = :address WHERE id = :id")
     suspend fun updatePickupAddress(id: Long, address: String)
+
+    /** 详情页编辑用定向更新（M20）：只改对应列，避免整行 update 用旧快照覆盖快速连改的其它字段。 */
+    @Query("UPDATE code_history SET code = :code WHERE id = :id")
+    suspend fun updateCode(id: Long, code: String)
+
+    @Query("UPDATE code_history SET source = :source WHERE id = :id")
+    suspend fun updateSource(id: Long, source: String)
+
+    @Query("UPDATE code_history SET cabinetNumber = :cabinet WHERE id = :id")
+    suspend fun updateCabinet(id: Long, cabinet: String)
 
     /** 批量归档：同 code+type 的所有活跃记录标记为已取（一次取件对应多份同码记录全部归档）。 */
     @Query("UPDATE code_history SET isActive = 0, doneAt = :doneAt WHERE code = :code AND type = :type AND isActive = 1")
@@ -88,8 +102,9 @@ interface CodeHistoryDao {
     @Query("SELECT COUNT(*) FROM (SELECT 1 FROM code_history WHERE isActive = 1 GROUP BY code, type HAVING COUNT(*) >= 2)")
     suspend fun countDuplicateGroups(): Int
 
-    /** H6 去重的保存结果：id = 记录 id，existed = 是否命中已存在的活跃记录（用于通知去重提示）。 */
-    class SaveResult(val id: Long, val existed: Boolean)
+    /** H6 去重的保存结果：id = 记录 id，existed = 是否命中已存在的活跃记录（用于通知去重提示）。
+     *  replacedScreenshotPath：本次更新覆盖掉的旧截图路径（调用方负责删除该孤儿文件）。 */
+    class SaveResult(val id: Long, val existed: Boolean, val replacedScreenshotPath: String = "")
 
     /**
      * H6: 事务内原子化「查询已有 + 插入/更新」，避免多入口(分享/无障碍/手动)并发对同一 code+type
@@ -99,6 +114,10 @@ interface CodeHistoryDao {
     suspend fun saveOrUpdate(history: CodeHistory): SaveResult {
         val existing = findByCodeAndType(history.code, history.type)
         return if (existing != null) {
+            // 新截图将覆盖旧路径时，把旧路径带出去给调用方删除文件（否则旧截图成 cacheDir 孤儿）
+            val replaced = if (history.screenshotPath.isNotBlank() &&
+                existing.screenshotPath.isNotBlank() &&
+                history.screenshotPath != existing.screenshotPath) existing.screenshotPath else ""
             update(existing.copy(
                 source = if (history.source.isNotBlank()) history.source else existing.source,
                 pickupAddress = if (history.pickupAddress.isNotBlank()) history.pickupAddress else existing.pickupAddress,
@@ -107,51 +126,22 @@ interface CodeHistoryDao {
                 rawTextSnippet = if (history.rawTextSnippet.isNotBlank()) history.rawTextSnippet else existing.rawTextSnippet,
                 shareSourcePkg = if (history.shareSourcePkg.isNotBlank()) history.shareSourcePkg else existing.shareSourcePkg,
                 shareSourceName = if (history.shareSourceName.isNotBlank()) history.shareSourceName else existing.shareSourceName,
+                // 新识别的到期时间优先，否则保留旧值（避免同码再次识别时到期提醒时间丢失）
+                expiryTime = if (history.expiryTime > 0) history.expiryTime else existing.expiryTime,
                 isActive = true,
                 doneAt = 0,
                 timestamp = history.timestamp
+                // 注意：geoVerified/geoConfidence/geoFormattedAddress 故意不在此合并——
+                // 它们由异步地图验证回调经 updateGeo() 定向写入，整行 copy 会把默认值覆盖掉已验证结果。
             ))
-            SaveResult(existing.id, true)
+            SaveResult(existing.id, true, replaced)
         } else {
             SaveResult(insert(history), false)
         }
     }
-
-    /**
-     * 原始去重语义（v1.0.4）：查重但照常新增，让同一 code 多次保存真实产生多行，
-     * 由「重复值整理」入口手动保留/删除。existed=是否已存在同 code+type（用于提示重复），
-     * 但每次都会 insert 新行（不再像 saveOrUpdate 那样合并成一行）。
-     *
-     * v1.0.9: 补全逻辑修复 —— 旧行补全后不再插入空新行，而是用合并后的行更新时间戳复用。
-     * 此前在旧行补完后仍 insert 一条新行，但活跃列表取 MAX(id)，用户看到的是那条地址/截图
-     * 为空的新行，而非被补全的旧行。
-     */
-    @Transaction
-    suspend fun insertCheckDuplicate(history: CodeHistory): SaveResult {
-        val existing = findByCodeAndType(history.code, history.type)
-        if (existing != null) {
-            // 将新记录的字段合并进旧行（新值优先，空值保留旧值）
-            val merged = existing.copy(
-                pickupAddress = if (history.pickupAddress.isNotBlank()) history.pickupAddress else existing.pickupAddress,
-                cabinetNumber = if (history.cabinetNumber.isNotBlank()) history.cabinetNumber else existing.cabinetNumber,
-                source = if (history.source.isNotBlank()) history.source else existing.source,
-                screenshotPath = if (history.screenshotPath.isNotBlank()) history.screenshotPath else existing.screenshotPath,
-                rawTextSnippet = if (history.rawTextSnippet.isNotBlank()) history.rawTextSnippet else existing.rawTextSnippet,
-                shareSourcePkg = if (history.shareSourcePkg.isNotBlank()) history.shareSourcePkg else existing.shareSourcePkg,
-                shareSourceName = if (history.shareSourceName.isNotBlank()) history.shareSourceName else existing.shareSourceName,
-                isActive = true,
-                doneAt = 0,
-                timestamp = history.timestamp
-            )
-            update(merged)
-            return SaveResult(existing.id, true)
-        }
-        val id = insert(history)
-        return SaveResult(id, false)
-    }
 }
 
-@Database(entities = [CodeHistory::class], version = 5, exportSchema = false)
+@Database(entities = [CodeHistory::class], version = 6, exportSchema = true)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun codeHistoryDao(): CodeHistoryDao
     val repository: CodeRepository by lazy { CodeRepository(codeHistoryDao()) }
@@ -188,6 +178,13 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** 5 → 6：新增到期提醒时刻列。ALTER 保留既有数据，默认 0（不提醒）。 */
+        private val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE code_history ADD COLUMN expiryTime INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
@@ -198,10 +195,10 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "pickup_code_db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
-                    // 兜底迁移：无 exportSchema 时首轮迁移难以严格校验 schema，仍保留 destructive 作为最后的保险，
-                    // 避免未知后续版本导致无法升级卡死；已通过 addMigrations 保住 3→4 的数据。
-                    .fallbackToDestructiveMigration()
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                    // 不再使用 fallbackToDestructiveMigration：它会静默删库重建，导致用户取件记录无提示丢失。
+                    // 已开 exportSchema=true（schemaLocation 见 build.gradle.kts）让 Room 校验迁移，
+                    // 未来迁移写错时应升级失败报错，而不是清空核心数据。
                     .build()
                     .also { INSTANCE = it }
             }

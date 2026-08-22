@@ -16,17 +16,19 @@ import com.pickupcode.app.extractor.CodeValidator.FOUR_SEGMENT_PARCEL
 import com.pickupcode.app.extractor.CodeValidator.LETTER_TWO_SEGMENT_PARCEL
 import com.pickupcode.app.extractor.CodeValidator.LETTER_DASH_FIVE_PARCEL
 import com.pickupcode.app.extractor.CodeValidator.LONG_NUMBER_PARCEL
+import com.pickupcode.app.extractor.CodeValidator.DIGIT_DASH_PARCEL
 
 object CodeExtractor {
 
     data class ExtractedCode(val code: String, val type: CodeType, val source: String, val confidence: Float)
     enum class CodeType { pickup_food, pickup_parcel, coupon }
 
-    // A8-3-3315: letter prefix + 3 dash-separated segments, e.g. locker codes (A/B/C prefix)
-    private val LETTER_THREE_SEG_PARCEL = Regex("\\b([A-Za-z]\\d{1,2})-(\\d{1,2})-(\\d{3,6})\\b", RegexOption.IGNORE_CASE)
-    private val LETTER_DASH_THREE_PARCEL = Regex("\\b([A-Za-z])-(\\d{3,4})\\b", RegexOption.IGNORE_CASE)
-    private val LETTER_NUMBER_FOOD = Regex("\\b([A-Z]\\s*[-]?\\s*\\d{2,4})\\b", RegexOption.IGNORE_CASE)
-    private val PURE_NUMBER_FOOD = Regex("\\b(?<![\\d-])(\\d{2,5})(?![\\d])\\b")
+    // 边界统一用 (?<![\dA-Za-z])/(?![\dA-Za-z]) 而非 \b：Android(ICU) 的 \b 把中文当词字符，
+    // 码值紧贴中文（如 "749019复制"）时 \b 失效漏抓；桌面 JVM 测不出来（ASCII \b），真机必现。    // A8-3-3315: letter prefix + 3 dash-separated segments, e.g. locker codes (A/B/C prefix)
+    private val LETTER_THREE_SEG_PARCEL = Regex("(?<![\\dA-Za-z])([A-Za-z]\\d{1,2})-(\\d{1,2})-(\\d{3,6})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
+    private val LETTER_DASH_THREE_PARCEL = Regex("(?<![\\dA-Za-z])([A-Za-z])-(\\d{3,4})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
+    private val LETTER_NUMBER_FOOD = Regex("(?<![\\dA-Za-z])([A-Z]\\s*[-]?\\s*\\d{2,4})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
+    private val PURE_NUMBER_FOOD = Regex("(?<![\\dA-Za-z-])(\\d{2,5})(?![\\dA-Za-z])")
     private val PREFIXED_CODE = Regex("(取[餐件货单]码|取餐号|取单号|排号|券号|提取码)[:：]?\\s*(?:为|是)?\\s*([A-Za-z0-9\\-]{2,12})")
     // 菜鸟/驿站类通知标准句式：凭1-6-5020到...取（件）；容忍 OCR 在码值与方位词间插入空格
     private val PING_CODE = Regex("(?:凭|好评码|提取码|券号)[:：]?\\s*([A-Za-z0-9\\-]{2,12}?)\\s*(?=(?:到|至|去|领|取|在|格|号柜|菜鸟|驿站|快递柜))", RegexOption.IGNORE_CASE)
@@ -35,8 +37,8 @@ object CodeExtractor {
     // 否则"231607 到育新路..."这类码后跟真实地址的会被漏抓（需保留开头强锚定 + 后不能紧邻数字/破折号）
     private val NEXT_LINE_CODE = Regex("^\\s*([A-Za-z0-9\\-]{2,12})\\s*(?![-\\d])")
     private val CODE_KEYWORD_NEAR = Regex("(取[件餐货]码|取餐号|驿站|快递柜|自提柜|取件点)")
-    private val ORDER_LONG_SQL = Regex("\\b\\d{6,}-\\d{5,}\\b")
-    private val ORDER_SHORT_SQL = Regex("\\b\\d{2,4}-\\d{3,4}-\\d{4,}\\b")
+    private val ORDER_LONG_SQL = Regex("(?<![\\dA-Za-z])\\d{6,}-\\d{5,}(?![\\dA-Za-z])")
+    private val ORDER_SHORT_SQL = Regex("(?<![\\dA-Za-z])\\d{2,4}-\\d{3,4}-\\d{4,}(?![\\dA-Za-z])")
     // 热循环正则预编译：避免每行/每次调用重复编译 Regex（原在 normalizeText 与逐行前缀匹配内 new）
     private val WHITESPACE_REGEX = Regex("\\s+")
     private val JOINED_PREFIX_CODE = Regex("^[餐件货单]码[A-Za-z0-9].*")
@@ -85,7 +87,7 @@ object CodeExtractor {
     )
 
     // ---------------------------------------------------------------
-    // 文本预处理：全角→半角归一化（借鉴反编译 App normalizeText）
+    // 文本预处理：全角→半角归一化（参考同类产品实现 normalizeText）
     // OCR 有时会把数字/符号读成全角（如 ０１２３、：、，），导致正则匹配失败。
     // ---------------------------------------------------------------
 
@@ -96,7 +98,7 @@ object CodeExtractor {
     )
 
     /**
-     * 归一化 OCR 文本：全角转半角 + 压缩空白（借鉴反编译 App SmsParser.normalizeText）。
+     * 归一化 OCR 文本：全角转半角 + 压缩空白（参考同类产品的文本归一化实现 normalizeText）。
      * 逐字符遍历，把全角数字/符号/空格转为半角等价物，然后把制表符/换行转空格，
      * 最后压缩连续空白为单个空格、去首尾空白。
      */
@@ -130,7 +132,7 @@ object CodeExtractor {
     }
 
     // ---------------------------------------------------------------
-    // 金融/支付短信相关性拦截（借鉴反编译 App isExpressRelatedSms）
+    // 金融/支付短信相关性拦截（参考同类产品实现 isExpressRelatedSms）
     // 银行、支付类通知的截图/短信里常出现数字（金额、验证码、余额），极易被当成取件码。
     // 规则：命中金融词且未命中快递词 → 判定为金融噪音，整段不识别。
     // ---------------------------------------------------------------
@@ -165,8 +167,8 @@ object CodeExtractor {
     // ---------------------------------------------------------------
 
     fun extract(lines: List<OCREngine.TextLine>, screenHeight: Int = 0, context: Context? = null, source: String = "screen"): List<ExtractedCode> {
-        // 文本预处理：全角→半角归一化（借鉴反编译 App normalizeText）
-        val lines = lines.map { it.copy(text = normalizeText(it.text)) }
+        // 文本预处理：全角→半角归一化 + 词级纠错表（参考同类产品实现 normalizeText / textCorrections）
+        val lines = lines.map { it.copy(text = OcrCorrections.apply(normalizeText(it.text))) }
         val candidates = mutableListOf<Candidate>()
         val allText = lines.joinToString(" ") { it.text }
         val isFoodContext = FOOD_KEYWORDS.any { allText.contains(it, ignoreCase = true) }
@@ -180,7 +182,7 @@ object CodeExtractor {
             PREFIXED_CODE.find(line.text)?.let { m ->
                 // OCR 常把前缀与码值间的连字符读进码值（取件码-12345 → "-12345"），trim 掉首尾 '-' 再校验
                 val code = m.groupValues[2].trim('-')
-                if (!isExcluded(code)) {
+                if (isValidStrongContextCode(code)) {
                     val p = m.groupValues[1]
                     candidates.add(Candidate(code,
                         if (p.contains("餐") || p.contains("单")) CodeType.pickup_food else CodeType.pickup_parcel,
@@ -195,7 +197,7 @@ object CodeExtractor {
                     val joined = prev.takeLast(1) + line.text.trim()
                     PREFIXED_CODE.find(joined)?.let { m ->
                         val code = m.groupValues[2].trim('-')
-                        if (!isExcluded(code)) {
+                        if (isValidStrongContextCode(code)) {
                             val p = m.groupValues[1]
                             candidates.add(Candidate(code,
                                 if (p.contains("餐") || p.contains("单")) CodeType.pickup_food else CodeType.pickup_parcel,
@@ -212,7 +214,7 @@ object CodeExtractor {
                 val nextLine = lines[i + 1].text.trim()
                 // Match pure numbers or letter-dash-number codes on the next line
                 val nextMatch = NEXT_LINE_CODE.find(nextLine)
-                if (nextMatch != null && !isExcluded(nextMatch.groupValues[1].trim('-'))) {
+                if (nextMatch != null && isValidStrongContextCode(nextMatch.groupValues[1].trim('-'))) {
                     val code = nextMatch.groupValues[1].trim('-')
                     val isFood = lines[i].text.contains("餐") || lines[i].text.contains("单")
                     candidates.add(Candidate(code,
@@ -230,7 +232,7 @@ object CodeExtractor {
         for (line in lines) {
             PING_CODE.findAll(line.text).forEach matchLoop@{ m ->
                 val code = m.groupValues[1].trim('-')
-                if (isExcluded(code) || code.length < 2) return@matchLoop
+                if (!isValidStrongContextCode(code) || code.length < 2) return@matchLoop
                 var s = SCORE_PREFIXED - PING_BASE_PENALTY
                 if (PARCEL_KEYWORDS.any { line.text.contains(it) }) s += PING_PARCEL_BONUS
                 if (THREE_SEGMENT_PARCEL.matches(code) || FOUR_SEGMENT_PARCEL.matches(code)) s += PING_MULTISEG_BONUS
@@ -246,6 +248,9 @@ object CodeExtractor {
             Rule(LETTER_DASH_FIVE_PARCEL, CodeType.pickup_parcel, SCORE_LETTER_DASH_FIVE, strong = true),
             Rule(LETTER_THREE_SEG_PARCEL, CodeType.pickup_parcel, SCORE_THREE_SEG, strong = true),
             Rule(LETTER_DASH_THREE_PARCEL, CodeType.pickup_parcel, SCORE_LETTER_DASH_THREE, strong = true),
+            // 兔喜式单段码（5-3858）：低分不 strong——同屏有更强段式码时被 top×0.75 过滤，
+            // 防 "1-6-5020" 的子串 "6-5020" 被误抓；带"取件码为"前缀的走 PREFIXED_CODE 高分强路径。
+            Rule(DIGIT_DASH_PARCEL, CodeType.pickup_parcel, SCORE_LONG_NUM_PARCEL),
             Rule(LONG_NUMBER_PARCEL, CodeType.pickup_parcel, SCORE_LONG_NUM_PARCEL, SCORE_CTX_BONUS),
             Rule(LETTER_NUMBER_FOOD, CodeType.pickup_food, SCORE_LETTER_NUM_FOOD, SCORE_CTX_BONUS, true),
             Rule(PURE_NUMBER_FOOD, CodeType.pickup_food, SCORE_PURE_NUM_FOOD, SCORE_CTX_BONUS, true, true)
@@ -256,6 +261,13 @@ object CodeExtractor {
         val regexToLearned = mutableMapOf<String, String>()
         if (context != null) {
             val learned = com.pickupcode.app.learner.PatternLearner.getLearnedPatterns(context)
+            // 诊断：已加载的自学习规则概览（仅 Debug 构建，避免无障碍热路径日志开销）
+            if (com.pickupcode.app.BuildConfig.DEBUG) {
+                val active = learned.count { it.enabled && it.badCount < 3 }
+                android.util.Log.d("LearnedDiag", "自学习规则共 ${learned.size} 条（启用 $active / 停用 ${learned.size - active}）: " +
+                    learned.filter { it.enabled && it.badCount < 3 }
+                        .joinToString { "${it.regex}[${it.type}]${if (it.decayed) "(衰减)" else ""}" })
+            }
             for (rule in learned) {
                 // A1: 用户手动停用的规则不再参与识别
                 // A1: 用户手动停用 → 跳过；badCount ≥ 3 → 自动停用
@@ -272,12 +284,26 @@ object CodeExtractor {
             }
         }
 
+        // B3: 命中已学规则时先记录 code→规则，待最终 results 确定后再 touchRule 刷新 lastUsedAt，
+        // 避免"幽灵匹配"（规则命中但候选因分数过低未进入最终结果）也给规则续命、架空衰减机制。
+        val learnedHits = mutableMapOf<String, String>()
+
         for (line in lines) {
             val pos = posBonus(line, screenHeight)
             val size = sizeBonus(line, avgFontHeight)
             for (rule in rules) {
                 rule.regex.findAll(line.text).forEach matchLoop@{ m ->
-                    if (isExcluded(m.value, context)) return@matchLoop
+                    if (isExcluded(m.value, context)) {
+                        // 诊断：被自学习排除词命中时单独提示（普通排除原因不逐条打，避免刷屏）
+                        if (context != null && PatternLearner.isLearnedExcluded(m.value, context)) {
+                            android.util.Log.d("LearnedDiag", "候选 ${m.value} 被自学习排除词命中剔除（规则 ${rule.regex.pattern}）")
+                        }
+                        return@matchLoop
+                    }
+                    // 诊断：已学规则命中（仅 Debug 构建）
+                    if (rule.isLearned && com.pickupcode.app.BuildConfig.DEBUG) {
+                        android.util.Log.d("LearnedDiag", "已学规则命中候选 ${m.value}（${rule.regex.pattern}）")
+                    }
                     // Auto-learned rules: reject over-short matches (e.g. X1 / A1 2-char noise)
                     if (rule.minMatchLen > 0 && m.value.length < rule.minMatchLen) return@matchLoop
                     var s = rule.baseScore + pos
@@ -302,10 +328,10 @@ object CodeExtractor {
                     val conflict = when (rule.type) { CodeType.pickup_food -> isParcelContext && !isFoodContext; CodeType.pickup_parcel -> isFoodContext && !isParcelContext; CodeType.coupon -> false }
                     if (conflict) s -= SCORE_CONFLICT_TYPE_PENALTY
 
-                    // B3: 命中已学规则 → 刷新其 lastUsedAt 并解除衰减（用 isLearned 标识，比 baseScore 判等更稳）
+                    // B3: 命中已学规则 → 先记录，待最终结果确定后统一 touchRule（见 extract 尾部）
                     if (context != null && rule.isLearned && m.value.length >= 3) {
                         regexToLearned[rule.regex.pattern]?.let { r ->
-                            PatternLearner.touchRule(context, r)
+                            learnedHits[m.value] = r
                         }
                     }
 
@@ -358,6 +384,23 @@ object CodeExtractor {
                 val ctx = if (lineIdx >= 0) lines[lineIdx].text else "?"
                 android.util.Log.d("CodeExtrDiag", "cand: code=${it.code} score=${it.score} type=${it.type} src=${it.source} line=$lineIdx ctx=$ctx")
             }
+            // 调试快照（识别调试视图用）：与日志同源，UI 面板直接消费
+            RecognitionDebugStore.capture(
+                lines = lines,
+                candidates = candidates.map { c ->
+                    val li = lines.indexOfFirst { l -> l.text.contains(c.code) }
+                    RecognitionDebugStore.CandidateInfo(
+                        code = c.code,
+                        score = c.score,
+                        type = c.type.name,
+                        source = c.source,
+                        lineIndex = li,
+                        context = if (li >= 0) lines[li].text else "?"
+                    )
+                },
+                allText = allText,
+                source = source
+            )
         }
         val seen = mutableSetOf<String>()
         val results = mutableListOf<ExtractedCode>()
@@ -369,11 +412,33 @@ object CodeExtractor {
             if (c.strong || c.score >= top * STRONG_PASS_RATIO)
                 results.add(ExtractedCode(c.code, c.type, c.source, (c.score / SCORE_PREFIXED).coerceIn(0f, 1f)))
         }
+        // B3: 仅对真正进入结果的码刷新对应已学规则的 lastUsedAt（幽灵匹配不再续命）
+        if (context != null) {
+            for (r in results) {
+                learnedHits[r.code]?.let { PatternLearner.touchRule(context, it) }
+            }
+        }
         if (context != null) recordLearning(context, results, allText, source)
         return results
     }
 
     private data class Candidate(val code: String, val type: CodeType, val score: Float, val source: String, val strong: Boolean = false)
+
+    /**
+     * 带强前缀上下文（取件码/取餐码/凭条号等）的码值校验。
+     * 标准白名单把纯数字收紧到 4-5 位以上（防裸数字 42/123 噪声），但带"取餐码为123"这类
+     * 强前缀时 2-3 位纯数字是真实取餐码（蜜雪/瑞幸常见，README 已声明 123 覆盖）——
+     * 此处放行 2-3 位纯数字，但仍过内容噪声检查（全 0 全 1/递增/连号等一律拒绝）。
+     */
+    private fun isValidStrongContextCode(code: String): Boolean {
+        val c = code.trim()
+        if (c.isBlank() || c.length > 12) return false
+        return if (c.all { it.isDigit() } && c.length in 2..3) {
+            !CodeValidator.isContentNoise(c)
+        } else {
+            !isExcluded(c)
+        }
+    }
 
     private fun posBonus(line: OCREngine.TextLine, screenHeight: Int): Float {
         val box = line.boundingBox ?: return 0f

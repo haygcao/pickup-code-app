@@ -2,15 +2,21 @@ package com.pickupcode.app.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ComponentName
+import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.service.quicksettings.TileService
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
+import com.pickupcode.app.App
+import com.pickupcode.app.BuildConfig
 import com.pickupcode.app.data.AppDatabase
 import com.pickupcode.app.data.CodeHistory
 import com.pickupcode.app.extractor.AIExtractor
@@ -25,6 +31,7 @@ import com.pickupcode.app.notification.CodeNotificationManager
 import com.pickupcode.app.ocr.OCREngine
 import com.pickupcode.app.preferences.AppPreferences
 import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import java.io.File
@@ -36,11 +43,77 @@ class PickupCodeAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "PickupCodeA11y"
         private const val CHANNEL_ID = "pickup_code_result"
-        // M12: 结果提示通知用独立保留 id 段（safeId 是 hash&0x7fffffff，此处用固定高位几乎不冲突）
-        private const val RESULT_NOTIFY_ID = 0x7FFFFF00
+        // 结果提示通知 id：占最高位 0x7FFFFFFF，与主通知池(1..0x3FFFFFFF)/提醒(0x4..)/去重(0x6..) 三段互不相交（M12）
+        private const val RESULT_NOTIFY_ID = 0x7FFFFFFF
 
         @JvmField
         val triggerRequested = AtomicBoolean(false)
+
+        /** 触发来源：true=磁贴（需等控制面板收起再扫），false=音量键（目标界面已在当前屏幕，立即扫）。 */
+        @Volatile
+        var triggerViaPanel = false
+            private set
+        /** 触发（武装）时刻。 */
+        @Volatile
+        private var armedAtMs = 0L
+        /** 武装后最后一次收到控制面板（systemui）窗口事件的时刻；0=武装后未见过面板事件。 */
+        @Volatile
+        private var lastSystemUiEventAtMs = 0L
+
+        private const val SYSTEMUI_PKG = "com.android.systemui"
+        /** 磁贴触发后，面板静默多久开始兜底扫描（用户有充分时间滑出面板并停在目标界面）。 */
+        private const val PANEL_SILENCE_MS = 2000L
+        /** 完全没收到面板事件（个别 ROM 不派发）时，武装多久后兜底扫描。 */
+        private const val PANEL_FALLBACK_MS = 2000L
+
+        /**
+         * 手动触发（磁贴/音量键）统一入口：置标记 + 记录来源与时刻。
+         * @param fromPanel true=快捷设置磁贴触发——消费策略会等控制面板收起；
+         *                  false=音量键/无障碍快捷方式触发——立即消费。
+         */
+        fun armManual(fromPanel: Boolean) {
+            triggerRequested.set(true)
+            triggerViaPanel = fromPanel
+            armedAtMs = System.currentTimeMillis()
+            lastSystemUiEventAtMs = 0
+        }
+
+        /** 服务实例当前是否已被系统真实绑定（区别于 Settings.Secure 里的开关字符串）。
+         *  onServiceConnected=true / onUnbind、onDestroy=false。 */
+        @Volatile
+        var connected = false
+            private set
+
+        /**
+         * 判断「服务真正在运行」：AccessibilityManager.getEnabledAccessibilityServiceList
+         * 只返回**已绑定**的服务（区别于 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES 字符串）。
+         * Xiaomi/HyperOS 杀进程/省电后常出现"设置里开着、服务实际没连上"的假连接状态——
+         * 磁贴/主界面必须用此检测，否则触发标记无人消费、点击静默失效。
+         */
+        fun isReallyConnected(context: Context): Boolean {
+            return try {
+                val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+                    ?: return false
+                val target = "${context.packageName}/${PickupCodeAccessibilityService::class.java.name}"
+                am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+                    .any { info ->
+                        // 标准路径：id = "包名/类名"
+                        val id = try { info.id } catch (_: Exception) { null }
+                        if (id != null) {
+                            id == target
+                        } else {
+                            // 个别 ROM 返回的 info 无 id：退到 resolveInfo 比对包名+类名
+                            info.resolveInfo?.serviceInfo?.let { si ->
+                                si.packageName == context.packageName &&
+                                    si.name == PickupCodeAccessibilityService::class.java.name
+                            } == true
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "查询无障碍真实连接状态失败", e)
+                false
+            }
+        }
 
         private val AUTO_SCAN_PACKAGES = setOf(
             "com.meituan", "com.sankuai", "me.ele", "com.eg.android",
@@ -49,19 +122,57 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         )
     }
 
-    // 实例级协程作用域：随服务实例创建/销毁，onUnbind 时 cancel 避免跨重建累积泄漏（H2）
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    /** 顶层协程异常兜底：SupervisorJob 不吞子协程异常，无 handler 时任何未捕获异常都会崩进程。
+     *  挂到 scope 上兜住所有 launch 子协程（节点遍历/验证/回填等），记日志 + 提示，不再崩溃。 */
+    private val exceptionHandler = CoroutineExceptionHandler { _, e ->
+        if (e is CancellationException) return@CoroutineExceptionHandler
+        Log.e(TAG, "协程未捕获异常", e)
+        showResult("识别出错")
+    }
+
+    // 实例级协程作用域：随服务实例创建/销毁，onUnbind 时 cancel 避免跨重建累积泄漏（H2）。
+    // 注意：服务实例在 onUnbind 后会被系统复用（再次 onServiceConnected）——因此必须 var，
+    // 在 onServiceConnected 里检测失效后重建，否则关一次无障碍再开会永久空转（Top1 修复）。
+    private var scope = CoroutineScope(Dispatchers.Main + SupervisorJob() + exceptionHandler)
     // 复用单例主线程 Handler：heartbeat 自续 + onAccessibilityEvent 延时调度共用，便于统一 removeCallbacks（H3/M2）
     private val mainHandler = Handler(Looper.getMainLooper())
-    // 截图回调线程池：模块级单例，避免每次 captureAndExtract 新建线程泄漏（M7）
-    private val screenshotExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // 截图回调线程池：模块级单例，避免每次 captureAndExtract 新建线程泄漏（M7）。
+    // 同 scope：onUnbind shutdownNow 后需在重连时重建（Top1 修复）。
+    private var screenshotExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    /** 异步释放 ML Kit 客户端。close() 会等待在途识别/检测完成（最长 30s/10s），
+     *  不能在 onUnbind/onDestroy 主线程里同步阻塞（ANR 风险）。 */
+    private fun closeMlKitClients() {
+        App.appScope.launch(Dispatchers.IO) {
+            try { OCREngine.close() } catch (_: Exception) {}
+            try { CouponDetector.close() } catch (_: Exception) {}
+        }
+    }
+
+    /** 让系统重新回调磁贴的 onStartListening，磁贴按本进程 connected 标志刷新亮/暗。 */
+    private fun notifyTileRefresh() {
+        try {
+            TileService.requestListeningState(this, ComponentName(this, PickupCodeTileService::class.java))
+        } catch (e: Exception) {
+            Log.w(TAG, "通知磁贴刷新失败: ${e.message}")
+        }
+    }
 
     private var lastAutoScanPkg: String? = null
     private var lastAutoScanTime = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        connected = true
         Log.d(TAG, "无障碍服务已连接")
+        // 通知磁贴刷新状态：vivo 等 ROM 上 AccessibilityManager.getEnabledAccessibilityServiceList
+        // 对已绑定服务会假阴性，磁贴以本进程 connected 标志为准（同进程内无 binder 歧义）
+        notifyTileRefresh()
+
+        // Top1: 服务实例可能在 onUnbind 后复用（用户关→开无障碍、系统临时解绑均会再次走到这里）。
+        // 上一轮 onUnbind 已 cancel scope / shutdown executor，必须重建，否则识别功能静默全废。
+        if (!scope.isActive) scope = CoroutineScope(Dispatchers.Main + SupervisorJob() + exceptionHandler)
+        if (screenshotExecutor.isShutdown) screenshotExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
         val info = AccessibilityServiceInfo().apply {
             // Medium-1: 只注册 WINDOW_STATE_CHANGED（服务只消费该事件），减少无关事件唤醒
@@ -74,46 +185,104 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         }
         serviceInfo = info
 
+        // 重连时先清掉可能残留的心跳任务，避免双心跳叠加
+        mainHandler.removeCallbacks(heartbeat)
         mainHandler.postDelayed(heartbeat, 3000)
+
+        // 冷启动竞态：磁贴可能在服务连接前已置标记。但**不在此立即扫描**——
+        // 此刻用户多半还站在控制面板里，立即截图会截到面板（小红书用户反馈"还在面板里就开始记录了"）。
+        // 交给心跳（按 triggerViaPanel 策略等面板收起）或窗口事件消费。
+        if (triggerRequested.get()) {
+            Log.d(TAG, "连接时触发标记待消费（按策略等待面板收起后自动扫描）")
+        }
     }
 
     private val heartbeat = object : Runnable {
         override fun run() {
-            if (triggerRequested.getAndSet(false)) {
-                Log.d(TAG, "心跳兜底扫描")
-                performScan("手动触发")
+            if (triggerRequested.get() && manualTriggerDue()) {
+                consumeManualTrigger("心跳兜底")
             }
             mainHandler.postDelayed(this, 3000)
         }
     }
 
+    /** 手动触发是否到了可扫描时刻：磁贴触发必须等控制面板收起（防截到面板），音量键立即。 */
+    private fun manualTriggerDue(): Boolean {
+        if (!triggerViaPanel) return true // 音量键：目标界面已在当前屏幕
+        val now = System.currentTimeMillis()
+        return if (lastSystemUiEventAtMs >= armedAtMs) {
+            // 武装后见过面板事件：面板已操作过，静默 PANEL_SILENCE_MS 后即可扫
+            now - lastSystemUiEventAtMs >= PANEL_SILENCE_MS
+        } else {
+            // 武装后未收到任何面板事件（个别 ROM 不派发 systemui 事件）：宽限 PANEL_FALLBACK_MS 后兜底扫
+            now - armedAtMs >= PANEL_FALLBACK_MS
+        }
+    }
+
+    /** 消费手动触发标记并调度扫描（延迟 1.2s 让控制面板收起动画完成，扫描前还会再校验活动窗口）。 */
+    private fun consumeManualTrigger(reason: String) {
+        if (triggerRequested.getAndSet(false)) {
+            triggerViaPanel = false
+            armedAtMs = 0
+            lastSystemUiEventAtMs = 0
+            Log.d(TAG, "磁贴触发消费（$reason），延迟扫描")
+            mainHandler.postDelayed({ performScanAfterPanelClose(0) }, 1200)
+        }
+    }
+
+    /**
+     * 扫描前再等一等：若当前活动窗口仍是系统控制面板/通知栏（个别 ROM 事件时序靠前），
+     * 每秒复查一次，最多推迟 6 秒，避免截图截到面板"显示没有码"。
+     */
+    private fun performScanAfterPanelClose(tries: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && tries < 6) {
+            val activePkg = try {
+                rootInActiveWindow?.packageName?.toString()
+            } catch (_: Exception) { null }
+            if (activePkg == SYSTEMUI_PKG) {
+                Log.d(TAG, "活动窗口仍是控制面板，推迟扫描(第${tries + 1}次)")
+                mainHandler.postDelayed({ performScanAfterPanelClose(tries + 1) }, 1000)
+                return
+            }
+        }
+        performScan("手动触发")
+    }
+
     override fun onUnbind(intent: android.content.Intent?): Boolean {
         // 收敛协程与 Handler，避免服务卸载后空转/泄漏（H2/H3）
+        connected = false
+        Log.d(TAG, "无障碍服务已解绑")
+        notifyTileRefresh()
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         screenshotExecutor.shutdownNow()
-        // 释放 ML Kit 客户端（unbind 未必紧跟 destroy，提前释放避免 native 累积）
-        try { OCREngine.close() } catch (_: Exception) {}
-        try { CouponDetector.close() } catch (_: Exception) {}
+        // 释放 ML Kit 客户端（unbind 未必紧跟 destroy，提前释放避免 native 累积）；异步，不在主线程阻塞
+        closeMlKitClients()
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
+        connected = false
+        notifyTileRefresh()
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         screenshotExecutor.shutdownNow()
-        // 释放 ML Kit 客户端，避免 native 资源随服务重建累积泄漏
-        try { OCREngine.close() } catch (_: Exception) {}
-        try { CouponDetector.close() } catch (_: Exception) {}
+        // 释放 ML Kit 客户端，避免 native 资源随服务重建累积泄漏；异步，不在主线程阻塞
+        closeMlKitClients()
         super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (triggerRequested.getAndSet(false)) {
-            Log.d(TAG, "磁贴触发，延迟扫描")
-            mainHandler.postDelayed({
-                performScan("手动触发")
-            }, 1200)
+        // 手动触发（磁贴/音量键）：
+        //  - 控制面板（systemui）窗口事件只记录时刻、不消费标记——面板还开着，截了也是面板；
+        //  - 非面板窗口事件 = 面板已收起、目标应用窗口回到前台 → 消费并延迟扫描。
+        if (triggerRequested.get()) {
+            val pkg = event?.packageName?.toString()
+            if (pkg == SYSTEMUI_PKG) {
+                lastSystemUiEventAtMs = System.currentTimeMillis()
+                return
+            }
+            consumeManualTrigger("窗口=${pkg ?: "?"}")
             return
         }
 
@@ -145,12 +314,24 @@ class PickupCodeAccessibilityService : AccessibilityService() {
 
     /** 仅节点文字模式（API < 30兜底），不存截图 */
     private fun performScanFromText(source: String) {
-        // 无障碍树递归 + 正则 + 学习文件 IO 均放 IO/Default，避免旧设备主线程卡顿
-        scope.launch(Dispatchers.Default) {
-            val settings = AppPreferences.observe(this@PickupCodeAccessibilityService).first()
-            val allText = collectAllText()
-            val lines = allText.lines().map { OCREngine.TextLine(it, null, null) }
-            tryExtract(allText, lines, null, settings, source)
+        scope.launch {
+            try {
+                val settings = AppPreferences.observe(this@PickupCodeAccessibilityService).first()
+                // 无障碍节点树遍历必须在主线程（AccessibilityNodeInfo 跨线程使用无官方保证，
+                // 部分 ROM/窗口销毁竞态下在后台线程遍历会抛异常崩进程）
+                val allText = withContext(Dispatchers.Main) { collectAllText() }
+                val lines = allText.lines().map { OCREngine.TextLine(it, null, null) }
+                // 正则/提取等 CPU 密集工作在 Default 线程
+                withContext(Dispatchers.Default) {
+                    tryExtract(allText, lines, null, settings, source)
+                }
+            } catch (e: CancellationException) {
+                throw e // 取消必须重抛
+            } catch (e: Exception) {
+                // 顶层兜底：节点遍历/提取偶发异常只记日志 + 提示，不再直达未捕获处理器崩进程
+                Log.e(TAG, "文本识别失败", e)
+                showResult("识别出错")
+            }
         }
     }
 
@@ -194,7 +375,20 @@ class PickupCodeAccessibilityService : AccessibilityService() {
                             ?: return showResult("截屏失败")
                         // 深拷贝为普通位图：wrapHardwareBuffer 返回的位图依赖 buf 存活，
                         // 若在 OCR 异步读取前 close buf 会读到已释放缓冲。拷贝后即可安全 close（H1）
-                        val bmp = hwBmp.copy(Bitmap.Config.ARGB_8888, false)
+                        // 内存峰值控制：全分辨率 1:1 copy 会与原图同时存活（2× 屏幕内存，4K 屏约 66MB）。
+                        // 拷贝时直接降采样到长边 ≤1920px（取件码/地址文本 OCR 足够），峰值显著下降。
+                        val maxDim = 1920f
+                        val scale = minOf(1f, maxDim / maxOf(hwBmp.width, hwBmp.height))
+                        val bmp = if (scale < 1f) {
+                            Bitmap.createScaledBitmap(
+                                hwBmp,
+                                (hwBmp.width * scale).toInt().coerceAtLeast(1),
+                                (hwBmp.height * scale).toInt().coerceAtLeast(1),
+                                true
+                            )
+                        } else {
+                            hwBmp.copy(Bitmap.Config.ARGB_8888, false)
+                        }
                         hwBmp.recycle()
 
                         scope.launch(Dispatchers.IO) {
@@ -286,9 +480,13 @@ class PickupCodeAccessibilityService : AccessibilityService() {
             screenshotPath = screenshotPath,
             repo = AppDatabase.getInstance(this@PickupCodeAccessibilityService).repository
         )
-        // 通知：冲突提示已由 notifyConflicts 统一处理，此处不区分 existed
+        // 通知：同码已存在(existed) → 重复提示；否则正常通知。与短信路径统一，避免重复截图时同码常驻通知堆叠。
         for (s in saved) {
-            CodeNotificationManager.show(this@PickupCodeAccessibilityService, s.code, s.type, s.source, s.id)
+            RecognitionPipeline.notifySaved(
+                context = this@PickupCodeAccessibilityService,
+                dupCountProvider = { AppDatabase.getInstance(this@PickupCodeAccessibilityService).repository.countDuplicateGroups() },
+                code = s.code, type = s.type, source = s.source, id = s.id, existed = s.existed
+            )
         }
 
         // ⑦ 快递100 验证：识别到取件码时，用运单号反查取件码/地址作为标准答案，对照 OCR 结果（fire-and-forget）
@@ -369,16 +567,9 @@ class PickupCodeAccessibilityService : AccessibilityService() {
     private fun verifyMapAddress(address: String, settings: AppPreferences.Settings) {
         if (settings.enableMapVerify && address.isNotBlank()) {
             scope.launch {
-                val result = GeocoderVerifier.verify(
-                    this@PickupCodeAccessibilityService, address,
-                    amapApiKey = settings.amapApiKey.ifBlank { null }
-                )
-                Log.d(TAG, "Map verify: verified=${result.verified}, confidence=${result.confidence}, provider=${result.provider}, address=$address")
-                if (result.verified) {
+                PostVerifier.verifyMap(this@PickupCodeAccessibilityService, address, settings.amapApiKey.ifBlank { null }) { conf, _ ->
                     try {
-                        PatternLearner.recordAddressVerified(
-                            this@PickupCodeAccessibilityService, address, result.confidence
-                        )
+                        PatternLearner.recordAddressVerified(this@PickupCodeAccessibilityService, address, conf)
                     } catch (e: Exception) {
                         Log.w(TAG, "recordAddressVerified failed: ${e.message}")
                     }
@@ -395,13 +586,29 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         // Medium-2: 自动扫描时静默（仅日志），不弹"未识别"通知
         if (!silent) {
             if (settings.enableAI && settings.apiKey.isNotBlank()) {
-                if (aiErr != null) showResult("未识别到取餐码/取件码 · AI识别失败(${aiErr.take(40)})")
+                // PII/端点防护：AI 错误原文可能含 URL/端点细节，不直接进用户通知，
+                // 只映射成类别文案（原始错误仍会经 mergeAiResults 落 Log.w 供排查）
+                if (aiErr != null) showResult("未识别到取餐码/取件码 · ${categorizeAiError(aiErr)}")
                 else showResult("未识别到取餐码/取件码")
             } else {
                 showResult("未识别到取餐码/取件码")
             }
         }
         return true
+    }
+
+    /** AI 错误原文 → 用户可读类别文案（不进通知的原始细节只写日志）。 */
+    private fun categorizeAiError(err: String): String {
+        val e = err.lowercase()
+        return when {
+            e.contains("timeout") || e.contains("timed out") -> "AI服务超时"
+            e.contains("401") || e.contains("unauthorized") || e.contains("api key") || e.contains("invalid key") -> "AI密钥无效"
+            e.contains("429") || e.contains("rate limit") || e.contains("too many") -> "AI请求过于频繁"
+            e.contains("404") || e.contains("model") -> "AI模型不可用"
+            e.contains("connect") || e.contains("network") || e.contains("socket") ||
+                e.contains("unreachable") || e.contains("refused") || e.contains("resolve") -> "网络连接失败"
+            else -> "AI识别失败"
+        }
     }
 
     /** ⑥ 冲突检测：同码同时匹配取餐/取件类型时返回该码（提示用户确认）。 */
@@ -435,23 +642,17 @@ class PickupCodeAccessibilityService : AccessibilityService() {
             val trackingNum = BrandResolver.findOrderNumber(allText)
             if (trackingNum != null) {
                 scope.launch {
-                    val res = Kuaidi100Verifier.query(settings.kuaidi100Key, trackingNum, Kuaidi100Verifier.guessCourierCode(trackingNum))
-                    Log.d(TAG, "Kuaidi100 verify: success=${res.success} code=${res.pickUpCode} station=${res.pickUpStation} address=${res.pickUpAddress} err=${res.errorMsg}")
-                    if (res.success && res.pickUpCode != null) {
-                        val ocrCodes = allResults.map { it.first }
-                        val matched = ocrCodes.any { it == res.pickUpCode }
-                        if (matched) {
-                            Log.d(TAG, "Kuaidi100 confirm: OCR码 ${res.pickUpCode} 与 API 一致 ✓")
-                        } else {
-                            Log.d(TAG, "Kuaidi100 mismatch: OCR=${ocrCodes}, API=${res.pickUpCode}")
-                        }
-                        // 若 OCR 未识别出地址，且 API 返回了标准地址，定向补全（不覆盖中间用户操作）
-                        if (address.isBlank() && !res.pickUpAddress.isNullOrBlank()) {
-                            val dao = AppDatabase.getInstance(this@PickupCodeAccessibilityService).codeHistoryDao()
-                            val rec = dao.findByCodeAndType(res.pickUpCode, CodeExtractor.CodeType.pickup_parcel.name)
-                            if (rec != null && rec.pickupAddress.isBlank()) {
-                                dao.updatePickupAddress(rec.id, res.pickUpAddress)
-                            }
+                    val res = PostVerifier.verifyKuaidi100(
+                        this@PickupCodeAccessibilityService, settings.kuaidi100Key, trackingNum,
+                        allResults.map { it.first }
+                    ) ?: return@launch
+                    val pCode = res.pickUpCode ?: return@launch
+                    // 若 OCR 未识别出地址，且 API 返回了标准地址，定向补全（不覆盖中间用户操作）
+                    if (address.isBlank() && !res.pickUpAddress.isNullOrBlank()) {
+                        val dao = AppDatabase.getInstance(this@PickupCodeAccessibilityService).codeHistoryDao()
+                        val rec = dao.findByCodeAndType(pCode, CodeExtractor.CodeType.pickup_parcel.name)
+                        if (rec != null && rec.pickupAddress.isBlank()) {
+                            dao.updatePickupAddress(rec.id, res.pickUpAddress)
                         }
                     }
                 }
@@ -494,7 +695,7 @@ class PickupCodeAccessibilityService : AccessibilityService() {
             // M12: 结果提示用独立保留 id 段，避免与 CodeNotificationManager.safeId 空间冲突
             nm.notify(RESULT_NOTIFY_ID, NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle("一键闪记").setContentText(msg)
+                .setContentTitle("码上闪记").setContentText(msg)
                 .setAutoCancel(true).setTimeoutAfter(3000).build())
         }
     }

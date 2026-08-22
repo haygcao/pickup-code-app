@@ -63,6 +63,8 @@ android {
             reset()
             include("arm64-v8a", "armeabi-v7a")
             isUniversalApk = false
+            // 注：AGP 8.x 已移除 splits.abi.versionCodes（3.x/4.x 旧 API）。当前按架构拆包、
+            // 各分包共用默认 versionCode，适合侧载分发；若需上架 Play，改用 App Bundle（AAB）由 Play 自动分发。
         }
     }
 
@@ -84,6 +86,12 @@ android {
         compose = true
         buildConfig = true
     }
+}
+
+// Room schema 导出目录：配合 @Database(exportSchema = true) 生成版本化 schema JSON，
+// 让 Room 能校验迁移链正确性（提交到仓库，配合 MigrationTestHelper 做迁移测试）。
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {

@@ -1,6 +1,8 @@
 package com.pickupcode.app.kuaidi100
 
 import android.util.Log
+import com.pickupcode.app.BuildConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -77,6 +79,8 @@ object Kuaidi100Verifier {
             } finally {
                 conn.disconnect()
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Query failed: ${e.message}")
             KuaidiResult(false, null, null, null, e.message)
@@ -91,7 +95,7 @@ object Kuaidi100Verifier {
     fun guessCourierCode(trackingNum: String): String? {
         val brand = com.pickupcode.app.extractor.BrandResolver.guessOrderBrand(trackingNum) ?: return null
         val code = BRAND_TO_KUAIDI100[brand]
-        if (code == null) Log.d(TAG, "No kuaidi100 mapping for brand: $brand (tracking: $trackingNum)")
+        if (code == null && BuildConfig.DEBUG) Log.d(TAG, "No kuaidi100 mapping for brand: $brand (tracking: $trackingNum)")
         return code
     }
 

@@ -8,6 +8,7 @@ import android.util.Base64
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import java.security.KeyStore
@@ -83,8 +84,11 @@ object AppPreferences {
     /** 主页「怎么添加取件码」引导卡是否已隐藏（永久） */
     private val KEY_HIDE_GUIDE_CARD = booleanPreferencesKey("hide_guide_card")
 
-    /** 是否接收短信取件码自动识别（需 READ_SMS 权限；借鉴反编译 App SmsReceiver）。 */
+    /** 是否接收短信取件码自动识别（需 READ_SMS 权限；参考同类产品实现）。 */
     private val KEY_ENABLE_SMS_RECEIVE = booleanPreferencesKey("enable_sms_receive")
+
+    /** 是否启用到期提醒（快递码存放 3 天/文本时限到达时自动提醒；v6）。 */
+    private val KEY_ENABLE_EXPIRY_REMIND = booleanPreferencesKey("enable_expiry_remind")
 
     /** 全部设置项的聚合快照：observe 的每次发射即一个不可变副本。 */
     data class Settings(
@@ -105,7 +109,8 @@ object AppPreferences {
         val kuaidi100Key: String = "",
         val hideAccessibilityCard: Boolean = false,
         val hideGuideCard: Boolean = false,
-        val enableSmsReceive: Boolean = false
+        val enableSmsReceive: Boolean = false,
+        val enableExpiryRemind: Boolean = true
     )
 
     /** 订阅设置 Flow：任一 key 变化即发射新的 [Settings] 快照；UI 侧用 collectAsState 消费。 */
@@ -129,82 +134,82 @@ object AppPreferences {
                 kuaidi100Key = decrypt(prefs[KEY_KUAIDI100_KEY] ?: ""),
                 hideAccessibilityCard = prefs[KEY_HIDE_ACCESSIBILITY_CARD] ?: false,
                 hideGuideCard = prefs[KEY_HIDE_GUIDE_CARD] ?: false,
-                enableSmsReceive = prefs[KEY_ENABLE_SMS_RECEIVE] ?: false
+                enableSmsReceive = prefs[KEY_ENABLE_SMS_RECEIVE] ?: false,
+                enableExpiryRemind = prefs[KEY_ENABLE_EXPIRY_REMIND] ?: true
             )
         }
     }
 
-    suspend fun setConfidenceThreshold(context: Context, value: Float) {
-        context.dataStore.edit { it[KEY_CONFIDENCE_THRESHOLD] = value }
+    /** 到期提醒开关（供入库管线排程前检查）。 */
+    suspend fun isExpiryRemindEnabled(context: Context): Boolean =
+        context.dataStore.data.first()[KEY_ENABLE_EXPIRY_REMIND] ?: true
+
+    suspend fun setEnableExpiryRemind(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_EXPIRY_REMIND, value)
+
+    // ── 泛化写入：消除 18 个重复的 dataStore.edit 样板 ──
+    private suspend fun <T> write(context: Context, key: Preferences.Key<T>, value: T) {
+        context.dataStore.edit { it[key] = value }
     }
 
-    suspend fun setEnableFood(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_FOOD] = value }
+    /** 加密字符串写入（API Key 类）。 */
+    private suspend fun writeEncrypted(context: Context, key: Preferences.Key<String>, value: String) {
+        context.dataStore.edit { it[key] = encrypt(value) }
     }
 
-    suspend fun setEnableParcel(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_PARCEL] = value }
-    }
+    suspend fun setConfidenceThreshold(context: Context, value: Float) =
+        write(context, KEY_CONFIDENCE_THRESHOLD, value)
 
-    suspend fun setEnableCoupon(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_COUPON] = value }
-    }
+    suspend fun setEnableFood(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_FOOD, value)
 
-    suspend fun setDarkMode(context: Context, value: String) {
-        context.dataStore.edit { it[KEY_DARK_MODE] = value }
-    }
+    suspend fun setEnableParcel(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_PARCEL, value)
 
-    suspend fun setApiKey(context: Context, value: String) {
-        context.dataStore.edit { it[KEY_API_KEY] = encrypt(value) }
-    }
+    suspend fun setEnableCoupon(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_COUPON, value)
 
-    suspend fun setApiBaseUrl(context: Context, value: String) {
-        context.dataStore.edit { it[KEY_API_BASE_URL] = value }
-    }
+    suspend fun setDarkMode(context: Context, value: String) =
+        write(context, KEY_DARK_MODE, value)
 
-    suspend fun setApiModel(context: Context, value: String) {
-        context.dataStore.edit { it[KEY_API_MODEL] = value }
-    }
+    suspend fun setApiKey(context: Context, value: String) =
+        writeEncrypted(context, KEY_API_KEY, value)
 
-    suspend fun setEnableAI(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_AI] = value }
-    }
+    suspend fun setApiBaseUrl(context: Context, value: String) =
+        write(context, KEY_API_BASE_URL, value)
 
-    suspend fun setEnableIntentReceive(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_INTENT_RECEIVE] = value }
-    }
+    suspend fun setApiModel(context: Context, value: String) =
+        write(context, KEY_API_MODEL, value)
 
-    suspend fun setEnableShareDetection(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_SHARE_DETECTION] = value }
-    }
+    suspend fun setEnableAI(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_AI, value)
 
-    suspend fun setEnableMapVerify(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_MAP_VERIFY] = value }
-    }
+    suspend fun setEnableIntentReceive(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_INTENT_RECEIVE, value)
 
-    suspend fun setAmapApiKey(context: Context, value: String) {
-        context.dataStore.edit { it[KEY_AMAP_API_KEY] = encrypt(value) }
-    }
+    suspend fun setEnableShareDetection(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_SHARE_DETECTION, value)
 
-    suspend fun setEnableKuaidi100(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_KUAIDI100] = value }
-    }
+    suspend fun setEnableMapVerify(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_MAP_VERIFY, value)
 
-    suspend fun setKuaidi100Key(context: Context, value: String) {
-        context.dataStore.edit { it[KEY_KUAIDI100_KEY] = encrypt(value) }
-    }
+    suspend fun setAmapApiKey(context: Context, value: String) =
+        writeEncrypted(context, KEY_AMAP_API_KEY, value)
 
-    suspend fun setHideAccessibilityCard(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_HIDE_ACCESSIBILITY_CARD] = value }
-    }
+    suspend fun setEnableKuaidi100(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_KUAIDI100, value)
 
-    suspend fun setHideGuideCard(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_HIDE_GUIDE_CARD] = value }
-    }
+    suspend fun setKuaidi100Key(context: Context, value: String) =
+        writeEncrypted(context, KEY_KUAIDI100_KEY, value)
 
-    suspend fun setEnableSmsReceive(context: Context, value: Boolean) {
-        context.dataStore.edit { it[KEY_ENABLE_SMS_RECEIVE] = value }
-    }
+    suspend fun setHideAccessibilityCard(context: Context, value: Boolean) =
+        write(context, KEY_HIDE_ACCESSIBILITY_CARD, value)
+
+    suspend fun setHideGuideCard(context: Context, value: Boolean) =
+        write(context, KEY_HIDE_GUIDE_CARD, value)
+
+    suspend fun setEnableSmsReceive(context: Context, value: Boolean) =
+        write(context, KEY_ENABLE_SMS_RECEIVE, value)
 
     // ---------------------------------------------------------------
     // B6: API Key 加密（AndroidKeyStore AES-GCM，密文存 DataStore）
@@ -235,14 +240,11 @@ object AppPreferences {
         null
     }
 
-    /** 加密明文；空串原样返回（保持默认值语义）；Keystore 不可用时回退明文（设置不彻底不可用，回退路径记日志）。 */
+    /** 加密明文；空串原样返回（保持默认值语义）；Keystore 不可用或加密失败时抛异常拒绝存储（H2）。 */
     private fun encrypt(plain: String): String {
         if (plain.isEmpty()) return plain
         val key = keystoreKey()
-        if (key == null) {
-            android.util.Log.w(TAG, "AndroidKeyStore 密钥不可用，API Key 回退明文存储（B6）")
-            return plain
-        }
+            ?: throw IllegalStateException("AndroidKeyStore 密钥不可用，拒绝明文存储 API Key")
         return try {
             val cipher = Cipher.getInstance(AES_TRANSFORM)
             cipher.init(Cipher.ENCRYPT_MODE, key)
@@ -250,8 +252,8 @@ object AppPreferences {
             ENC_PREFIX + Base64.encodeToString(cipher.iv, Base64.NO_WRAP) +
                 "." + Base64.encodeToString(ct, Base64.NO_WRAP)
         } catch (e: Exception) {
-            android.util.Log.w(TAG, "AES-GCM 加密失败，API Key 回退明文存储（B6）: ${e.message}")
-            plain
+            // H2: 加密失败拒绝明文落盘，抛异常让写入失败（调用方 runCatching 捕获，保留旧值）
+            throw IllegalStateException("AES-GCM 加密失败，拒绝明文存储 API Key", e)
         }
     }
 

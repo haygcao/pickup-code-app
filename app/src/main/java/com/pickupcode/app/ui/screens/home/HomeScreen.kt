@@ -49,6 +49,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,6 +76,7 @@ import java.time.ZoneId
 fun HomeScreen(
     hasNotificationPermission: Boolean,
     isAccessibilityEnabled: Boolean,
+    accessibilityEnabledInSettings: Boolean,
     hideAccessibilityCard: Boolean,
     hideGuideCard: Boolean,
     onRequestNotificationPermission: () -> Unit,
@@ -98,6 +100,8 @@ fun HomeScreen(
     val dedupCount by vm::dedupCount
     var typeFilter by remember { mutableStateOf("all") }
     var guideExpanded by remember { mutableStateOf(false) }
+    // 分组方式：time=按时间 / address=按地址聚合（rememberSaveable：旋转屏幕保持）
+    var groupMode by rememberSaveable { mutableStateOf("time") }
 
     val filteredHistory = remember(activeHistory, typeFilter) {
         activeHistory.filter { h ->
@@ -126,13 +130,17 @@ fun HomeScreen(
             }
         }
     }
-            val groupOrder = listOf("今天", "昨天", "更早").filter { it in grouped }
+    val groupOrder = listOf("今天", "昨天", "更早").filter { it in grouped }
 
-            LaunchedEffect(Unit) { vm.cleanExpired(db.repository) }
+    // 地址聚合分组（空地址归「未填地址」，码最多的地址排前）
+    val addressGroups: List<Pair<String, List<CodeHistory>>> =
+        remember(filteredHistory) { HomeGrouping.byAddress(filteredHistory) }
+
+            LaunchedEffect(Unit) { vm.cleanExpired() }
 
             // 共享操作：标记已取/删除 → 移入回收站 → snackbar 撤销
             fun markAsDone(item: CodeHistory) {
-                vm.markAsDone(item, db.repository,
+                vm.markAsDone(item,
                     onSuccess = {
                         scope.launch {
                             val result = snackbarHostState.showSnackbar(
@@ -141,7 +149,7 @@ fun HomeScreen(
                                 duration = SnackbarDuration.Short
                             )
                             if (result == SnackbarResult.ActionPerformed) {
-                                vm.undoDone(item, trashHistory, db.repository)
+                                vm.undoDone(item, trashHistory)
                             }
                         }
                     },
@@ -151,14 +159,13 @@ fun HomeScreen(
                 )
             }
 
-    LaunchedEffect(activeHistory) { vm.refreshDedupCount(db.repository) }
+    LaunchedEffect(activeHistory) { vm.refreshDedupCount() }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
-                    Text("一键闪记", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                    Text("码上闪记", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 },
                 actions = {
                     IconButton(onClick = onStatsClick) {
@@ -187,16 +194,31 @@ fun HomeScreen(
             }
         }
     ) { padding ->
-        LazyColumn(
+        // 顶部提示层：snackbar（"已移至回收站"/错误提示）固定显示在界面上方（顶部栏之下），
+        // 不再默认贴屏幕底部（用户要求：弹窗放到界面上方）
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .background(MaterialTheme.colorScheme.background),
-            contentPadding = PaddingValues(bottom = 80.dp)
         ) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background),
+                contentPadding = PaddingValues(bottom = 80.dp)
+            ) {
             // FilterChips
             item {
                 FilterChipRow(currentFilter = typeFilter, onFilterChange = { typeFilter = it })
+            }
+
+            // 分组方式切换（按时间 / 按地址聚合）
+            item {
+                GroupModeToggle(
+                    mode = groupMode,
+                    onModeChange = { groupMode = it },
+                    modifier = Modifier.padding(top = 2.dp, bottom = 4.dp)
+                )
             }
 
             // 通知权限
@@ -223,10 +245,17 @@ fun HomeScreen(
             // 无障碍服务卡片
             if (!hideAccessibilityCard) {
                 item {
-                    val containerColor = if (isAccessibilityEnabled)
-                        MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.tertiaryContainer
-                    val title = if (isAccessibilityEnabled) "✅ 无障碍服务已开启" else "🔧 需要开启无障碍服务"
+                    // 三态：开启且运行 / 设置里开了但服务未运行（被系统杀，vivo 常见）/ 未开启
+                    val containerColor = when {
+                        isAccessibilityEnabled -> MaterialTheme.colorScheme.primaryContainer
+                        accessibilityEnabledInSettings -> MaterialTheme.colorScheme.errorContainer
+                        else -> MaterialTheme.colorScheme.tertiaryContainer
+                    }
+                    val title = when {
+                        isAccessibilityEnabled -> "✅ 无障碍服务已开启"
+                        accessibilityEnabledInSettings -> "⚠️ 无障碍服务未在运行"
+                        else -> "🔧 需要开启无障碍服务"
+                    }
 
                     Card(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
@@ -243,20 +272,24 @@ fun HomeScreen(
                                 }
                             }
                             if (isAccessibilityEnabled) {
-                                Text("打开控制面板 → 点✏️编辑 → 找到「一键闪记」→ 拖到面板",
+                                Text("打开控制面板 → 点✏️编辑 → 找到「码上闪记」→ 拖到面板",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Spacer(Modifier.height(4.dp))
-                                Text("固定后点击磁贴，再在3秒内退出控制面板即可自动识别",
+                                Text("点磁贴后滑出控制面板，在取件码界面稍候，自动识别并通知结果",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.primary,
                                     fontWeight = FontWeight.Medium)
                             } else {
-                                Text("开启后点快捷设置磁贴即可自动识别屏幕上的取餐码/取件码",
+                                Text(
+                                    if (accessibilityEnabledInSettings)
+                                        "系统设置里已开启，但服务实际未在运行——大概率被系统省电策略关闭了。点下方按钮到设置页把「码上闪记」关掉再打开一次。"
+                                    else "开启后点快捷设置磁贴即可自动识别屏幕上的取餐码/取件码",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                                 Spacer(Modifier.height(8.dp))
-                                Button(onClick = onEnableAccessibility) { Text("去开启") }
+                                Button(onClick = onEnableAccessibility) { Text(if (accessibilityEnabledInSettings) "去重新开启" else "去开启") }
                             }
                         }
                     }
@@ -289,10 +322,21 @@ fun HomeScreen(
                                 Spacer(Modifier.height(6.dp))
                                 Text("·从短信/聊天 App 分享", style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("（在短信/聊天里长按选中文字或点分享 → 选「码上闪记」）",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text("·点右下角 ➕ 手动粘贴", style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text("·通过无障碍服务调用OCR识别", style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Spacer(Modifier.height(10.dp))
+                                Button(
+                                    onClick = onHideGuideCard,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text("我知道了")
+                                }
                             }
                         }
                     }
@@ -317,7 +361,9 @@ fun HomeScreen(
                 }
             }
 
-            // 去重提示
+            // 去重入口：有重复时才显示（用户要求：无重复时不显示）。
+            // 注意：H6 起保存走 saveOrUpdate（同码+同类型自动合并成一行），新识别不产生重复行，
+            // 只有历史遗留的重复组（或手动产生的）才会让入口出现；清理完后入口自动隐藏。
             if (dedupCount > 0) {
                 item {
                     Card(
@@ -357,109 +403,58 @@ fun HomeScreen(
                             }
                         }
                     } else {
-                        // 全新空状态：三个引导入口卡片
-                        Column(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 16.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        // 无记录占位
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp, horizontal = 16.dp),
+                            contentAlignment = Alignment.Center
                         ) {
-                            Text(
-                                "欢迎使用一键闪记",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(bottom = 4.dp)
-                            )
-                            Text(
-                                "选择一种方式开始记录取件码",
+                            Text("暂无记录",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(bottom = 8.dp)
-                            )
-
-                            // 方式一：无障碍自动识别
-                            Card(
-                                modifier = Modifier.fillMaxWidth().clickable { onEnableAccessibility() },
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-                                shape = RoundedCornerShape(14.dp)
-                            ) {
-                                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text("🔧", fontSize = 28.sp)
-                                    Spacer(Modifier.width(12.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text("开启无障碍自动识别",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            fontWeight = FontWeight.SemiBold)
-                                        Text("打开控制面板一键自动识别取件码",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    Text("→", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-
-                            // 方式二：从截图/分享导入
-                            Card(
-                                modifier = Modifier.fillMaxWidth().clickable { onFabClick() },
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-                                shape = RoundedCornerShape(14.dp)
-                            ) {
-                                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text("📸", fontSize = 28.sp)
-                                    Spacer(Modifier.width(12.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text("从截图/分享导入",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            fontWeight = FontWeight.SemiBold)
-                                        Text("从其他App分享文本或截图识别",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    Text("→", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-
-                            // 方式三：手动输入
-                            Card(
-                                modifier = Modifier.fillMaxWidth().clickable { onFabClick() },
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-                                shape = RoundedCornerShape(14.dp)
-                            ) {
-                                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text("⌨️", fontSize = 28.sp)
-                                    Spacer(Modifier.width(12.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text("手动输入取件码",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            fontWeight = FontWeight.SemiBold)
-                                        Text("直接输入或粘贴取件码文字",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    Text("→", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
             }
 
-            // 时间分组列表
-            groupOrder.forEach { groupLabel ->
-                item(key = "header_$groupLabel") {
-                    TimeGroupHeader(label = groupLabel)
+            // 列表：按地址聚合 / 按时间分组
+            if (groupMode == "address") {
+                addressGroups.forEach { (addr, groupItems) ->
+                    item(key = "addr_header_$addr") {
+                        AddressGroupHeader(address = addr.ifBlank { "未填地址" }, count = groupItems.size)
+                    }
+                    items(groupItems, key = { it.id }) { cardItem ->
+                        CodeHistoryCard(
+                            item = cardItem,
+                            onClick = { onItemClick(cardItem.id) },
+                            onDone = { markAsDone(cardItem) },
+                            onDelete = { markAsDone(cardItem) }
+                        )
+                    }
                 }
-                val groupItems = grouped[groupLabel] ?: emptyList()
-                items(groupItems, key = { it.id }) { item ->
-                    CodeHistoryCard(
-                        item = item,
-                        onClick = { onItemClick(item.id) },
-                        onDone = { markAsDone(item) },
-                        onDelete = { markAsDone(item) }
-                    )
+            } else {
+                groupOrder.forEach { groupLabel ->
+                    item(key = "header_$groupLabel") {
+                        TimeGroupHeader(label = groupLabel)
+                    }
+                    val groupItems = grouped[groupLabel] ?: emptyList()
+                    items(groupItems, key = { it.id }) { item ->
+                        CodeHistoryCard(
+                            item = item,
+                            onClick = { onItemClick(item.id) },
+                            onDone = { markAsDone(item) },
+                            onDelete = { markAsDone(item) }
+                        )
+                    }
                 }
             }
-        }
+            }  // LazyColumn 结束
+            // 顶部提示层：画在列表之上，固定在界面上方（顶部栏之下）
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+            )
+        }  // Box 结束
     }
 }

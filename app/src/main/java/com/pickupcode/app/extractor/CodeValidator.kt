@@ -6,12 +6,20 @@ import com.pickupcode.app.learner.PatternLearner
 /** 码格式校验：合法格式白名单、排除规则与 pattern-ID 分类（自 CodeExtractor 拆出，R1）。 */
 object CodeValidator {
 
-    /** 5 个共享解析正则（CodeExtractor 识别用 + 本类的格式分类表用，单一归属）。 */
-    internal val THREE_SEGMENT_PARCEL = Regex("\\b(\\d{1,3})-(\\d{1,2})-(\\d{3,6})\\b")
-    internal val FOUR_SEGMENT_PARCEL = Regex("\\b([A-Za-z]?\\d{1,2})-(\\d{1,2})-(\\d{1,2})-(\\d{2,4})\\b")
-    internal val LETTER_TWO_SEGMENT_PARCEL = Regex("\\b([A-Z])-(\\d{1,2})-(\\d{3,4})\\b", RegexOption.IGNORE_CASE)
-    internal val LETTER_DASH_FIVE_PARCEL = Regex("\\b([A-Za-z])-?(\\d{5,6})\\b", RegexOption.IGNORE_CASE)
-    internal val LONG_NUMBER_PARCEL = Regex("\\b(\\d{6,8})\\b")
+    /** 5 个共享解析正则（CodeExtractor 识别用 + 本类的格式分类表用，单一归属）。
+     *  边界说明（重要）：不用 \b，改用显式环视 (?<![\dA-Za-z]) / (?![\dA-Za-z])。
+     *  桌面 JVM 的 \b 是 ASCII 语义，但 Android libcore 的 java.util.regex 基于 ICU，
+     *  \b 把中文视为词字符——码值紧贴中文时（如 OCR 行 "749019复制"）末尾 \b 失效导致漏抓。
+     *  （PatternLearner.PURE_CANDIDATE 早已用同样写法规避此坑，见其注释。） */
+    internal val THREE_SEGMENT_PARCEL = Regex("(?<![\\dA-Za-z])(\\d{1,3})-(\\d{1,2})-(\\d{3,6})(?![\\dA-Za-z])")
+    internal val FOUR_SEGMENT_PARCEL = Regex("(?<![\\dA-Za-z])([A-Za-z]?\\d{1,2})-(\\d{1,2})-(\\d{1,2})-(\\d{2,4})(?![\\dA-Za-z])")
+    internal val LETTER_TWO_SEGMENT_PARCEL = Regex("(?<![\\dA-Za-z])([A-Z])-(\\d{1,2})-(\\d{3,4})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
+    internal val LETTER_DASH_FIVE_PARCEL = Regex("(?<![\\dA-Za-z])([A-Za-z])-?(\\d{5,6})(?![\\dA-Za-z])", RegexOption.IGNORE_CASE)
+    internal val LONG_NUMBER_PARCEL = Regex("(?<![\\dA-Za-z])(\\d{6,8})(?![\\dA-Za-z])")
+    /** 兔喜生活/妈妈驿站式单段码：柜架组号-码（如 5-3858、12-3456）。
+     *  注意：必须与 VALID_CODE_FORMATS 全串白名单一致；评分低（60），
+     *  同屏存在更强段式码时会被 top×0.75 过滤，避免把 "1-6-5020" 的子串 "6-5020" 误抓成码。 */
+    internal val DIGIT_DASH_PARCEL = Regex("(?<![\\dA-Za-z])(\\d{1,2})-(\\d{3,5})(?![\\dA-Za-z])")
 
     private const val PATTERN_PREFIXED = "PREFIXED_CODE"
 
@@ -27,7 +35,7 @@ object CodeValidator {
         Regex("\\b\\d{4}-\\d{1,2}\\b"), // date suffix like 1124-15
         Regex("\\b\\d{6,8}-\\d{5,}\\b"), // full order number
         Regex("\\b[xX]\\d{1,2}\\b"), // shopping cart quantity marker (x1, x2, ...) — not a pickup code
-        // --- 借鉴反编译 App SmsParser.isInterferenceCode 增强干扰排除 ---
+        // --- 参考同类产品干扰排除实现（isInterferenceCode） ---
         // URL 碎片（http/https/ftp 开头的链接残片）
         Regex("https?://\\S*"), Regex("ftp://\\S*"),
         // 域名模式（xxx.com / xxx.cn / xxx.net 等，OCR 常读到的纯数字假域名也在此类）
@@ -53,34 +61,45 @@ object CodeValidator {
     /**
      * 公开：校验字符串是否为合法取餐/取件码格式（复用全部已知规则）。
      * 供 AI 提取结果过滤噪声（AI 不比正则可靠，需格式白名单把关）。
-     * 增强版（借鉴反编译 App SmsParser.isValidPickupCode 的 11 项过滤）：先做格式匹配，
+     * 增强版（参考同类产品实现 isValidPickupCode 的 11 项过滤）：先做格式匹配，
      * 再做内容排除（全零全一/递增序列/4连重复/xxx/手机号/拼音噪声等）。
+     * 注意：此为**无上下文**校验，2-3 位纯数字一律拒绝（42/123 裸数字噪声）；
+     * 带"取餐码/取件码"强前缀的短码请用 CodeExtractor 的上下文校验路径。
      */
     fun isValidPickupCode(code: String): Boolean {
         val c = code.trim()
         if (c.length !in 1..14) return false
         // 第一步：格式白名单匹配（原有检查）
         if (!VALID_CODE_FORMATS.any { it.matches(c) }) return false
-        // 第二步：内容排除（借鉴反编译 App，过滤噪声数字模式）
+        // 第二步：内容排除（参考同类产品，过滤噪声数字模式）
+        return !isContentNoise(c)
+    }
+
+    /**
+     * 内容噪声检查（与格式无关）：全零全一 / 递增序列 / 4 连重复 / xxx / 手机号子串 / 拼音噪声等。
+     * 拆出供强前缀上下文路径复用（取餐码 123 这类短码跳过格式白名单但必须过内容检查）。
+     */
+    internal fun isContentNoise(code: String): Boolean {
+        val c = code.trim()
         val stripped = c.replace("-", "").replace(" ", "")
         val len = stripped.length
-        if (len < 2 || len > 20) return false
+        if (len < 2 || len > 20) return true
         // 86 开头手机号子串
-        if (stripped.startsWith("86") && stripped.length in 8..13) return false
+        if (stripped.startsWith("86") && stripped.length in 8..13) return true
         // 全 0 或全 1
-        if (stripped.all { it == '0' } || stripped.all { it == '1' }) return false
+        if (stripped.all { it == '0' } || stripped.all { it == '1' }) return true
         // 递增数字序列（0123 ~ 7890）——全串精确匹配，不用子串 contains 避免误杀（如 10123 包含 0123）
-        if (stripped.length == 4 && INCREMENTING_DIGITS.contains(stripped)) return false
+        if (stripped.length == 4 && INCREMENTING_DIGITS.contains(stripped)) return true
         // 递增字母序列（abcd ~ wxyz）——同样全串精确匹配
         val lower = stripped.lowercase()
-        if (lower.length == 4 && INCREMENTING_LETTERS.contains(lower)) return false
+        if (lower.length == 4 && INCREMENTING_LETTERS.contains(lower)) return true
         // 含"手机/电话/时间"拼音噪声
-        if (listOf("手机", "电话", "时间", "shouji", "dianhua", "shijian").any { lower.contains(it) }) return false
+        if (listOf("手机", "电话", "时间", "shouji", "dianhua", "shijian").any { lower.contains(it) }) return true
         // 4 连重复字符（aaaa、1111）
-        if (Regex("(.)\\1{3,}").containsMatchIn(stripped)) return false
+        if (Regex("(.)\\1{3,}").containsMatchIn(stripped)) return true
         // xxx 模式（占位/噪声）
-        if (Regex("[xX]{3,}").containsMatchIn(stripped)) return false
-        return true
+        if (Regex("[xX]{3,}").containsMatchIn(stripped)) return true
+        return false
     }
 
     // 合法取件/取餐码格式白名单（与上方解析正则一一对应，去锚点/去分组后用于全串匹配）
@@ -91,13 +110,15 @@ object CodeValidator {
         Regex("[A-Za-z]-?\\d{5,6}"),                                  // LETTER_DASH_FIVE
         Regex("[A-Za-z]\\d{1,2}-\\d{1,2}-\\d{3,6}", RegexOption.IGNORE_CASE), // LETTER_THREE_SEG
         Regex("[A-Za-z]-\\d{3,4}", RegexOption.IGNORE_CASE),          // LETTER_DASH_THREE
+        Regex("\\d{1,2}-\\d{3,5}"),                                     // DIGIT_DASH_PARCEL 兔喜式（5-3858）
         Regex("\\d{6,8}"),                                            // LONG_NUMBER
         Regex("[A-Z]\\s*-?\\s*\\d{2,4}", RegexOption.IGNORE_CASE),  // LETTER_NUMBER_FOOD
         // PURE_NUMBER_FOOD：手动/AI 校验无上下文，收紧为 4-5 位，避免 2-3 位裸数字(42/123)被当合法码
         Regex("\\d{4,5}"),
-        // PREFIXED_CODE / PING_CODE 格式：覆盖带前缀上下文的码值（如 取餐码AB12、凭1-6-5020 等）
-        // 收紧：必须含数字（(?=.*\d)），纯字母串（ABC/hello）不再被 catch-all 放行
-        Regex("(?=.*\\d)[A-Za-z0-9\\-]{2,12}")
+        // PREFIXED_CODE / PING_CODE 格式：覆盖带前缀上下文的码值（如 取餐码AB12 等）
+        // 收紧：必须同时含字母和数字（(?=.*[A-Za-z])(?=.*\d)），纯字母串与纯数字串都不再被 catch-all 放行，
+        // 否则 "12/42/123" 这类 2-3 位裸数字会绕过 PURE_NUMBER_FOOD 的"4-5 位"收紧而通过校验。
+        Regex("(?=.*[A-Za-z])(?=.*\\d)[A-Za-z0-9\\-]{2,12}")
     )
 
     /** 递增数字序列：排除 0123 / 1234 ... 7890 */
@@ -118,6 +139,7 @@ object CodeValidator {
         "LETTER_TWO_SEGMENT_PARCEL" to LETTER_TWO_SEGMENT_PARCEL,
         "LETTER_DASH_FIVE_PARCEL" to LETTER_DASH_FIVE_PARCEL,
         "LONG_NUMBER_PARCEL" to LONG_NUMBER_PARCEL,
+        "DIGIT_DASH_PARCEL" to DIGIT_DASH_PARCEL,
     )
 
     internal fun classifyFormat(code: String): String {
