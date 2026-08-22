@@ -2,12 +2,14 @@ package com.pickupcode.app.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
@@ -44,6 +46,31 @@ class PickupCodeAccessibilityService : AccessibilityService() {
 
         @JvmField
         val triggerRequested = AtomicBoolean(false)
+
+        /** 服务实例当前是否已被系统真实绑定（区别于 Settings.Secure 里的开关字符串）。
+         *  onServiceConnected=true / onUnbind、onDestroy=false。 */
+        @Volatile
+        var connected = false
+            private set
+
+        /**
+         * 判断「服务真正在运行」：AccessibilityManager.getEnabledAccessibilityServiceList
+         * 只返回**已绑定**的服务（区别于 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES 字符串）。
+         * Xiaomi/HyperOS 杀进程/省电后常出现"设置里开着、服务实际没连上"的假连接状态——
+         * 磁贴/主界面必须用此检测，否则触发标记无人消费、点击静默失效。
+         */
+        fun isReallyConnected(context: Context): Boolean {
+            return try {
+                val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+                    ?: return false
+                val target = "${context.packageName}/${PickupCodeAccessibilityService::class.java.name}"
+                am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+                    .any { it.id == target }
+            } catch (e: Exception) {
+                Log.w(TAG, "查询无障碍真实连接状态失败", e)
+                false
+            }
+        }
 
         private val AUTO_SCAN_PACKAGES = setOf(
             "com.meituan", "com.sankuai", "me.ele", "com.eg.android",
@@ -84,6 +111,7 @@ class PickupCodeAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        connected = true
         Log.d(TAG, "无障碍服务已连接")
 
         // Top1: 服务实例可能在 onUnbind 后复用（用户关→开无障碍、系统临时解绑均会再次走到这里）。
@@ -105,6 +133,14 @@ class PickupCodeAccessibilityService : AccessibilityService() {
         // 重连时先清掉可能残留的心跳任务，避免双心跳叠加
         mainHandler.removeCallbacks(heartbeat)
         mainHandler.postDelayed(heartbeat, 3000)
+
+        // 冷启动竞态修复：磁贴可能在服务连接完成前就已置好触发标记
+        // （进程刚被磁贴点击拉起时两个 binding 并行），连接后立即消费，不干等 3 秒心跳。
+        // 否则在旧版上会误以为"点了没反应"——实际只是等心跳。
+        if (triggerRequested.getAndSet(false)) {
+            Log.d(TAG, "连接后立即消费触发标记")
+            mainHandler.post { performScan("手动触发") }
+        }
     }
 
     private val heartbeat = object : Runnable {
@@ -119,6 +155,7 @@ class PickupCodeAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
         // 收敛协程与 Handler，避免服务卸载后空转/泄漏（H2/H3）
+        connected = false
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         screenshotExecutor.shutdownNow()
@@ -128,6 +165,7 @@ class PickupCodeAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        connected = false
         mainHandler.removeCallbacksAndMessages(null)
         scope.cancel()
         screenshotExecutor.shutdownNow()

@@ -263,7 +263,7 @@ fun HomeScreen(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Spacer(Modifier.height(4.dp))
-                                Text("固定后点击磁贴，再在3秒内退出控制面板即可自动识别",
+                                Text("固定后停留在要识别的界面，点击磁贴即可自动识别并通知结果",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.primary,
                                     fontWeight = FontWeight.Medium)

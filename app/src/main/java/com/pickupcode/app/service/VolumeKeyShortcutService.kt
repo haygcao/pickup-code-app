@@ -3,6 +3,7 @@ package com.pickupcode.app.service
 import android.accessibilityservice.AccessibilityService
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.widget.Toast
 
 /**
  * 双音量键快捷触发（澎湃记方案，2026-08-13）：
@@ -25,7 +26,17 @@ class VolumeKeyShortcutService : AccessibilityService() {
         // 用完即走：本服务不常驻，仅作为系统快捷方式的触发通道
         disableSelf()
         // 复用磁贴的触发路径：置标记 → 常驻服务心跳检测到后执行截图识别
-        PickupCodeAccessibilityService.triggerRequested.set(true)
-        Log.d("VolumeKeyShortcut", "音量键触发：识别标记已设置")
+        // 服务假连接防护：主无障碍服务实际未连接时标记无人消费，直接提示（同磁贴修复）
+        if (PickupCodeAccessibilityService.isReallyConnected(this)) {
+            PickupCodeAccessibilityService.triggerRequested.set(true)
+            Log.d("VolumeKeyShortcut", "音量键触发：识别标记已设置")
+        } else {
+            Log.w("VolumeKeyShortcut", "主无障碍服务未运行，触发标记将无人消费")
+            try {
+                Toast.makeText(this, "码上闪记无障碍服务未在运行，请先重新开启", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Log.w("VolumeKeyShortcut", "Toast 失败: ${e.message}")
+            }
+        }
     }
 }
